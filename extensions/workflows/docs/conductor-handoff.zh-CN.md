@@ -2,7 +2,7 @@
 
 **用途**：在新会话里继续这项工作，无需重读全部历史。
 
-**读取顺序**：先读本文件（当前状态 + 不要重新踩的坑），再读同目录的 [`conductor-spec.zh-CN.md`](conductor-spec.zh-CN.md)（设计契约，M5 之后的所有实现都按它走）。
+**读取顺序**：先读本文件（当前状态 + 不要重新踩的坑），再读同目录的 [`conductor-spec.zh-CN.md`](conductor-spec.zh-CN.md)（设计契约，M5 之后的所有实现都按它走）。在 Pi 里人工验证见 [`conductor-verify.zh-CN.md`](conductor-verify.zh-CN.md)。
 
 ---
 
@@ -145,7 +145,9 @@ node --test --experimental-strip-types --test-name-pattern="retr|throttle" exten
 
 **当前基线**：101 个测试 / 94 通过 / **0 失败** / 7 cancelled（= Node 22 下先前就挂住的 3 个 + 被连带取消的 4 个）。
 
-**端到端未验证**：工具层集成（`resume`、`block` 挂起 → `workflow_answer` → 恢复）**没有自动化测试**，需要真实 Pi 运行时。被测的是它依赖的契约层。这一条需要用户在真实环境跑一次。
+**端到端未验证**：工具层集成（`resume`、`block` 挂起 → `workflow_answer` → 恢复）**没有自动化测试**，需要真实 Pi 运行时。被测的是它依赖的契约层。人工验证步骤见 [`conductor-verify.zh-CN.md`](conductor-verify.zh-CN.md)（7 个场景，含隔离 agent 目录的做法）。
+
+**测试会撞上的一个待决问题**：前台 run 非 `completed` 结束时工具是 `throw` 出去的（`index.ts:1189`），所以 `awaiting-input` 显示成工具失败，而模型对工具失败的自然反应是重试——不带 `resume` 的重试会开新 run、新 blocker、白花钱。建议把 `awaiting-input` / `replan-required` 改为正常返回，`failed` / `aborted` 继续抛。**尚未改动**，需先决定。
 
 ---
 

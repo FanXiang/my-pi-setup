@@ -35,8 +35,9 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { formatActivityStatus } from "../shared/activity-status.ts";
 import { createWorkflowPersistence, persistWorkflowJson } from "./artifacts.ts";
-import { RunController } from "./controller.ts";
+import { MAX_CONCURRENCY, RunController } from "./controller.ts";
 import { sessionWorkflowRunIds, showWorkflowDashboard } from "./dashboard.ts";
+import { formatThrottle, RateLimitGovernor } from "./governor.ts";
 import {
   extractMeta,
   prepareWorkflowScript,
@@ -135,9 +136,12 @@ function errorText(error: unknown): string {
 function summaryLine(details: WorkflowDetails): string {
   const { done, failed } = countStates(details);
   const settled = done + failed;
+  const throttle = details.throttle
+    ? formatThrottle(details.throttle)
+    : undefined;
   return `workflow ${details.name ?? details.runId}: ${settled}/${details.agents.length} agents${
     details.currentPhase ? ` · ${details.currentPhase}` : ""
-  }`;
+  }${throttle ? ` · ${throttle}` : ""}`;
 }
 
 function writeRunFile(runDir: string, name: string, content: string) {
@@ -208,7 +212,7 @@ function listRuns(
         runId,
         name: parsed.name,
         status:
-          parsed.status === "running"
+          parsed.status === "running" || parsed.status === "throttled"
             ? "aborted"
             : (parsed.status ?? "unknown"),
         done: agents.filter((agent) => agent.state !== "running").length,
@@ -414,7 +418,12 @@ export default function workflows(pi: ExtensionAPI) {
 
       // Background runs survive Esc on the parent turn, but all runs are
       // aborted and settled during session shutdown.
-      const controller = new RunController(background ? undefined : signal);
+      const governor = new RateLimitGovernor(MAX_CONCURRENCY);
+      const controller = new RunController(
+        background ? undefined : signal,
+        MAX_CONCURRENCY,
+        governor,
+      );
 
       // Each concurrent child gets its own extension runtime. All children use
       // the parent cwd and live trust decision.
@@ -439,7 +448,21 @@ export default function workflows(pi: ExtensionAPI) {
           details: compactToolDetails(details),
         });
       };
+      /** Refresh the stored throttle snapshot and the run's displayed status. */
+      const syncThrottle = () => {
+        const snapshot = governor.snapshot();
+        details.throttle = snapshot;
+        if (details.status === "running" && snapshot.remainingMs > 0) {
+          details.status = "throttled";
+        } else if (
+          details.status === "throttled" &&
+          snapshot.remainingMs <= 0
+        ) {
+          details.status = "running";
+        }
+      };
       const emit = (checkpoint = true) => {
+        syncThrottle();
         if (checkpoint) persistence.checkpoint();
         if (emitTimer) return;
         emitTimer = setTimeout(
@@ -451,6 +474,9 @@ export default function workflows(pi: ExtensionAPI) {
         if (emitTimer) clearTimeout(emitTimer);
         flush();
       };
+      // A throttle changes what the run is doing, so surface it immediately
+      // rather than waiting for the next agent event.
+      const unsubscribeGovernor = governor.subscribe(() => emit());
 
       const phaseFn = (title: unknown) => {
         const text = String(title);
@@ -587,6 +613,15 @@ export default function workflows(pi: ExtensionAPI) {
                 record.transcript = progress.transcript;
                 emit();
               },
+              onRetry: (observation) => {
+                record.retries = observation.attempt;
+                // The child is still retrying; pausing the run now is what
+                // keeps its siblings off an already-throttled quota.
+                if (observation.failure.throttle) {
+                  governor.noteThrottle(observation.failure);
+                }
+                emit();
+              },
             });
 
             record.usage = outcome.usage;
@@ -600,10 +635,20 @@ export default function workflows(pi: ExtensionAPI) {
             );
             record.finishedAt = Date.now();
             record.state = outcome.ok ? "done" : "error";
+            if (outcome.retries.length > 0)
+              record.retries = outcome.retries.length;
             if (outcome.ok) {
               delete record.error;
+              delete record.failure;
+              governor.noteSuccess();
             } else {
               record.error = outcome.error ?? "Agent failed";
+              if (outcome.failure) record.failure = outcome.failure;
+              if (outcome.failure?.throttle) {
+                governor.noteThrottle(outcome.failure);
+              } else {
+                governor.noteFailure();
+              }
             }
             emit();
 
@@ -652,8 +697,10 @@ export default function workflows(pi: ExtensionAPI) {
             record.error ?? "Agent did not settle before run cleanup";
           record.finishedAt = Date.now();
         }
+        unsubscribeGovernor();
         details.status = status;
         details.finishedAt = Date.now();
+        details.throttle = governor.snapshot();
         try {
           persistence.flush();
         } catch (error) {

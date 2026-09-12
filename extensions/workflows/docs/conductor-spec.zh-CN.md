@@ -1,6 +1,6 @@
 # Workflow v2：指挥型工作流规格（待审）
 
-状态：**草案，待审**。本文件是后续实现的契约；代码尚未改动。
+状态：**草案，待审**。本文件是后续实现的契约。**M1 已实现**（§13），其余部分仍是设计。
 
 ## 0. 背景与本版定位
 
@@ -248,50 +248,60 @@ interface LedgerEntry {
 
 ## 5. 失败分类、重试与限流治理（G2）
 
-### 5.1 错误分类是前置条件
+### 5.0 SDK 已有三层重试（Q1 的结论）
 
-现状：`runner.ts` 的 `AgentOutcome` 只有 `error?: string`，把 429、provider 5xx、逻辑错误、闸门不过**全部拍平成一个字符串**。在这个基础上无法做正确重试。必须先加分类：
+审阅 `@earendil-works/pi-ai@0.82.1` 与 `@earendil-works/pi-coding-agent@0.82.1` 的结论：**重试不需要我们造，分类可以直接复用，但 HTTP 状态码和 `retry-after` 拿不到。**
+
+| 层 | 位置 | 行为 | 配置 |
+| --- | --- | --- | --- |
+| HTTP 请求 | `pi-ai/dist/utils/provider-retry.js` `retryProviderRequest` | 复刻 OpenAI/Anthropic SDK 策略：认 `x-should-retry` 头、`retry-after-ms`/`retry-after`、状态 408/409/429/≥500，指数退避带抖动，可中断 | `settings.retry.provider.maxRetries` / `.maxRetryDelayMs`（默认 60000） |
+| 单次 assistant 调用 | `pi-ai/dist/utils/retry.js` `retryAssistantCall` | 整个 assistant 调用级重试，带 `onRetryScheduled` / `onRetryAttemptStart` / `onRetryFinished` 回调 | 同 `settings.retry` |
+| 会话轮次 | `pi-agent/dist/core/agent-session.js` `_prepareRetry` / `_willRetryAfterAgentEnd` | 重试整个 agent 轮次，退避 `baseDelayMs * 2^(attempt-1)`，把错误消息从 agent 状态里摘掉，**并发出可观测事件** | `settings.retry.enabled`（默认 true）/ `.maxRetries`（3）/ `.baseDelayMs`（2000） |
+
+结论有三条，直接改写了本版设计：
+
+1. **引擎不再实现步骤内重试。** 子会话已经重试过了；outcome 到达引擎时那份预算已经花完。再加一层会变成乘法（3 × N）。
+2. **分类直接复用 SDK 的判定。** `isRetryableAssistantError()` 与 `isContextOverflow()` 从 `@earendil-works/pi-ai` 公开导出（`dist/index.js` 重导出 `utils/retry.js` 与 `utils/overflow.js`）。它们的模式表正是 SDK 自己的重试循环所用的那份，包括把配额/账单类 429（`GoUsageLimitError`、`insufficient_quota`、`quota exceeded`…）判为**不可重试**。我们只负责在"可重试"之内再分出是哪一类，供节流治理路由。
+3. **`auto_retry_start` / `auto_retry_end` 在公开事件联合里**（`pi-agent/dist/core/agent-session.d.ts:72,78`），携带 `attempt` / `maxAttempts` / `delayMs` / `errorMessage`。这是**最早**能观测到限流的时刻——子 agent 还在退避中，就足以让兄弟 agent 停止加压。
+
+### 5.1 错误分类
+
+**`status` 与 `headers` 只存在于 pi-ai 内部**：`isProviderError()` 检查 `error.status`（number）与 `error.headers instanceof Headers`，`getRetryDelayMs()` 读 `retry-after-ms` / `retry-after`。这些都被 `retryProviderRequest` 消费掉，**不会到达扩展**。扩展侧只有 `AssistantMessage.errorMessage?: string` + `stopReason`。
+
+唯一泄漏出来的结构化信息：当服务端要求的延迟超过 `maxRetryDelayMs`（默认 60 秒）时，请求立即失败，消息形如 `Server requested 90s retry delay (max: 60s). <provider 原文>` —— 可解析出真实的 `retryAfterMs`。`parseServerRequestedDelayMs()` 就做这件事。
 
 ```ts
 type FailureClass =
-  | "rate_limit"            // 429，可能带 retry-after
-  | "overloaded"            // 529 / provider 过载
-  | "provider_error"        // 5xx、连接中断
-  | "first_response_stall"  // 触发 FIRST_RESPONSE_TIMEOUT_MS
-  | "tool_timeout"          // 单工具调用超时
-  | "context_exhausted"     // 上下文打满
-  | "aborted"
-  | "agent_error"           // 模型自身把任务做失败了
-  | "no_structured_output"
-  | "internal";
+  | "rate_limit" | "overloaded" | "provider_error" | "first_response_stall"
+  | "tool_timeout" | "quota_exhausted" | "context_exhausted" | "aborted"
+  | "agent_error" | "no_structured_output" | "session_create_failed" | "internal";
 
 interface FailureInfo {
   class: FailureClass;
   message: string;
+  /** 等待并重试有可能成功。由 SDK 的 isRetryableAssistantError() 判定。 */
+  transient: boolean;
+  /** 该暂停整个 run，而不只是这一步。 */
+  throttle: boolean;
   retryAfterMs?: number;
-  provider?: string;
   model?: string;
 }
 ```
 
-分类来源：`AgentSession` 的 `msg.errorMessage` / `stopReason`（`runner.ts` 已收集）+ provider HTTP 状态与 `retry-after` 头。**若 SDK 当前不暴露状态码，这是一个阻塞点，需先确认**（见 §14 未决问题 Q1）。
+分类优先级（顺序即语义，不可调换）：
 
-### 5.2 重试策略
+1. `aborted` / `contextOverflow` 先于一切文本匹配——一个因上下文打满而失败的调用，错误文本里常常同时带着 429。
+2. **配额模式先于限流模式**。配额限制以 429 语义返回，当成节流会让 run 等一个永远不会打开的窗口。
+3. 其余按 `rate_limit` → `overloaded` → `provider_error` 细分；`transient` 取 SDK 的判定，模式只决定**是哪一类**。
 
-```ts
-interface RetryPolicy {
-  maxAttempts: number;        // 默认 4
-  baseMs: number;             // 默认 2000
-  maxMs: number;              // 默认 120000
-  jitter: true;               // 必须有抖动
-  retryOn: FailureClass[];    // 默认 rate_limit / overloaded / provider_error / first_response_stall / tool_timeout
-}
-```
+### 5.2 重试与步骤级再尝试
 
-- 退避：`min(maxMs, baseMs * 2^(attempt-1))` + 随机抖动。
-- `rate_limit` 带 `retryAfterMs` 时以它为下界。
-- **不重试**：`agent_error`、`no_structured_output`、`context_exhausted`、`aborted`、预算耗尽。这些走闸门/升级路径，不是抖动。
-- `maxAttempts` 耗尽后：步骤记 `failed`，run **不立即失败**——转 `suspended` 并记录 `resumeAfter`，保住其余已完成进度。这正是"模型服务异常后还能接着执行"的语义。
+- **步骤内重试 = SDK 的职责**，引擎只观测（`RetryObservation[]`，`onRetry` 回调）并记账。
+- **步骤级再尝试 = 引擎的职责**，但它不是"再退避一次"，而是"throttle 窗口过去之后再排一次"。等待由治理器（§5.3）掌握，不是每步各自睡觉。这部分随 M2 的台账一起落地：没有台账，失败的步骤无处记录尝试次数。
+- **不重试**：`quota_exhausted`、`context_exhausted`（交给 compaction）、`aborted`、`agent_error`、`no_structured_output`、预算耗尽。
+- 当 SDK 预算耗尽且失败仍是 transient 时，步骤记 `failed`，run 转 `suspended` 并记 `resumeAfter`，保住其余进度（M2）。
+
+**一个不要踩的坑**：`SettingsManager.setRetryEnabled()` 写的是用户的**全局**设置文件。若用户全局关掉了重试，子 agent 会继承关闭状态——此时应当**提示**，绝不可代为改写用户设置。
 
 ### 5.3 限流治理（全局降速）
 
@@ -474,17 +484,18 @@ interface ProcedureMeta {
 
 | 位置 | 改动 |
 | --- | --- |
-| `runner.ts` `AgentOutcome` | 加 `failure: FailureInfo`；错误分类（§5.1）。**所有重试逻辑的前置条件** |
+| `runner.ts` `AgentOutcome` | ✅ 加 `failure: FailureInfo` 与 `retries: RetryObservation[]`；订阅 `auto_retry_*` 并通过 `onRetry` 早报限流 |
 | `runner.ts` `SessionManager.inMemory(options.cwd)` | 换成持久化 SessionManager；同仓已有先例 `extensions/subagents/src/backends/pi.ts:290` 的 `SessionManager.create(task.cwd)`。顺带可借用 `extensions/subagents/src/ui/takeover.ts` 实现子 agent 接管 |
 | `runner.ts` `FIRST_RESPONSE_TIMEOUT_MS`（45s）、工具 3 分钟超时 | 支持按步骤覆盖；跑测试的 implement 步骤必然顶满默认值 |
 | `sandbox.ts` `onAgent` | 包一层 ledger 查表：命中直接返回，未命中才真跑。约 40 行 |
 | `sandbox.ts` `MAX_AGENT_REQUESTS` / `controller.ts` `MAX_AGENT_CALLS` | 由"单次 run 计数"改为"计划级预算 + 跨恢复持久化"（§4.4） |
-| `controller.ts` `Semaphore` | 接入 RateLimitGovernor：可动态调并发、可被 `throttleUntil` 暂停 |
-| `model.ts` `WorkflowStatus` | 加 `throttled` / `suspended` / `awaiting-input` / `awaiting-parent` / `replan-required`；`statusSquare` / `statusWord` / `statusColor` 各加分支 |
+| `controller.ts` `Semaphore` | ✅ 加 `setLimit()`（只放大时放行队列，缩小不杀在途）；`schedule()` 在取信号量前 `await governor.wait()`；导出 `MAX_CONCURRENCY` |
+| `model.ts` `WorkflowStatus` | ✅ 已加 `throttled`（含 `statusSquare` / `statusColor` 分支、`AgentRecord.failure`/`.retries`、`WorkflowDetails.throttle`）；`suspended` / `awaiting-input` / `awaiting-parent` / `replan-required` 待 M2–M4 |
 | `index.ts:395` `background = (params.background ?? false) && ctx.hasUI` | 加 headless 执行路径：`mode: "detached"` 不依赖 `hasUI` |
 | `index.ts:294` `session_shutdown` 全量 abort | detached run 改为**落盘后脱离**而非 abort；会话结束不杀 detached run（本版最小实现：落盘 + 下次会话可恢复；常驻 supervisor 属 N1） |
 | `artifacts.ts` | 新增 ledger / blockers / assumptions 的原子追加写；复用现有 `writeFileAtomic` 与节流 checkpoint |
 | `prompt.ts` | 重写工具描述；移除 "ultracode" 口令闸门；新增 plan/report/answer 的模型面文档 |
+| `dashboard.ts` | ✅ `throttled` 纳入状态收窄与陈旧 run 回收——此前一个持久化为 `throttled` 的死 run 会被显示成 `completed` |
 
 ## 13. 里程碑与验收测试
 
@@ -492,7 +503,7 @@ interface ProcedureMeta {
 
 | M | 内容 | 验收 |
 | --- | --- | --- |
-| **M1** | 错误分类 + 重试 + RateLimitGovernor | 注入前两次 `provider_error`：步骤在第 3 次成功，ledger 有 3 条记录（2 failed / 1 ok）。注入带 `retry-after` 的 429：run 转 `throttled`，期间不发起任何新步骤，到点后并发从 1 逐级回升 |
+| **M1** ✅ | 错误分类 + 重试观测 + RateLimitGovernor | **已完成。** `failure.ts` 分类（10 个测试，含"配额 429 不得当节流"）、`governor.ts` 节流治理（10 个测试，含窗口只延不缩、AIMD 回升、`wait` 的中断语义）、`controller.ts` 的准入闸门（4 个测试：节流期间零启动、在途不受扰、成功后重开槽位）、`runner.ts` 的 `recordRetryObservation`（4 个测试）。步骤级再尝试与 ledger 记账随 M2 落地 |
 | **M2** | Ledger + 恢复 | 5 步计划在第 3 步杀进程；恢复后只跑 3–5 步，步骤 1–2 的 agent 调用数为 0；`budgetUsed` 跨恢复累计正确 |
 | **M3** | git SHA 钉住与传递作废 | 恢复前外部改动 HEAD：`effects != readonly` 的步骤被作废，其下游亦被作废；`readonly` 步骤保留 |
 | **M4** | L1/L2/L3 + 通知送达 + 回答消费 | AFK run 触发 L3：状态 `awaiting-input`，blocker 文件完整（含 recommendation 与 choices），通知送达被记录；`workflow_answer` 后恢复并越过该步 |
@@ -506,7 +517,8 @@ interface ProcedureMeta {
 
 ## 14. 未决问题（需审阅决策）
 
-- **Q1（阻塞 M1）**：`@earendil-works/pi-coding-agent` 的 `AgentSession` 是否暴露 provider HTTP 状态码与 `retry-after`？若只有 `errorMessage` 字符串，`rate_limit` 只能靠文本匹配识别——可接受的临时方案，但要确认 SDK 是否有更好的出口。
+- ~~**Q1（阻塞 M1）**：SDK 是否暴露 provider HTTP 状态码与 `retry-after`？~~ **已确认，见 §5.0/§5.1。** 结论：不暴露——状态码与头只存在于 pi-ai 内部；扩展侧只有 `errorMessage` 字符串，所以 `rate_limit` 确实靠文本匹配识别，但**用的是 SDK 自己那份模式表**（`isRetryableAssistantError()` 公开导出），不是我们另写一套。真实 `retry-after` 只在超过 `maxRetryDelayMs` 时以 `Server requested Ns retry delay` 文本泄漏出来，已解析。另有两个意外收获：SDK 已有三层重试，引擎不该再加一层；`auto_retry_start` 事件让限流在子 agent 仍在退避时就可观测。
+- **Q1b（新，需决策）**：用户若在全局设置里关掉 `retry.enabled`，工作流子 agent 会继承关闭状态，长跑会变脆。是（a）检测到就提示、尊重用户设置，还是（b）给工作流子 agent 一个独立的重试配置键？倾向 (a)，因为 `setRetryEnabled()` 会改写用户全局设置文件，引擎无权这么做。
 - **Q2**：计划合成由谁做？（a）主会话模型按 provider 的 `listProcedures` 自己拼；（b）provider 的 `suggestPlan` 给草案、模型补 brief。倾向 (a) 起步，(b) 作为 matt-pocock 侧增强。
 - **Q3**：`workItemId` 与 matt-pocock 现有会话态（`src/workflow.ts` 的 `WORKFLOW_STATE_ENTRY`）如何对齐？是 v2 run 反向写回 matt-pocock 的状态记录，还是二者共用 `workItemId` 但各记各的？倾向后者（低耦合），但 `/matt-pocock` 菜单里需要能看到关联的 run。
 - **Q4**：detached run 在本版是否真的要脱离会话？最小可行是"会话结束前落盘，下次会话手动/自动恢复"，完整脱离需要常驻 supervisor（N1）。倾向最小可行。
@@ -524,3 +536,5 @@ interface ProcedureMeta {
 6. 执行期不存在"问用户"，只存在 L1/L2/L3 与 `replan-required`。
 7. 没有一条成功送达记录的 L3 不算有效挂起。
 8. 全部 run 状态可由外部进程仅凭磁盘读取重建（为 N1 留门）。
+9. 引擎不改写用户的全局设置文件；不合意的设置只提示，不代劳。
+10. 不在 SDK 已有重试之上叠加步骤内重试。

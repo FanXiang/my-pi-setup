@@ -116,7 +116,10 @@ export class RunController {
     parentSignal?: AbortSignal,
     concurrency = MAX_CONCURRENCY,
     governor?: RateLimitGovernor,
+    /** Calls already charged by earlier attempts of a resumed run. */
+    initialCalls = 0,
   ) {
+    this.callCount = Math.max(0, Math.floor(initialCalls));
     this.governor = governor;
     this.semaphore = new Semaphore(
       Math.max(1, Math.min(MAX_CONCURRENCY, Math.floor(concurrency))),

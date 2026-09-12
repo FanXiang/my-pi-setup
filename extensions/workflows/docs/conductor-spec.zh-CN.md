@@ -190,6 +190,28 @@ interface Predicate {
 
 `ledger.jsonl` 与 `answers.jsonl` 是 **append-only**，任何恢复路径都不得改写历史行。
 
+### 4.1.1 Plan IR 之前的键设计（M2 实现）
+
+Plan IR 尚不存在，所以没有 `stepId`。键必须从今天就有的东西推出来，而**调用序号不可用**：`sandbox-child.cjs` 的 `mapLimited` 把下一个数组下标交给最先完成的 worker，所以一旦超过并发数，调用发起顺序在两次运行之间就不一致。
+
+实际采用：**内容寻址 + 出现序号**
+
+```
+inputHash  = sha256(prompt ⊕ canonicalJson(schema) ⊕ model ⊕ provider ⊕ effort)
+key        = `${inputHash}#${occurrence}`
+```
+
+- `canonicalJson` 对对象键排序，所以同一 schema 写法不同也哈希相同。
+- 模型选择进哈希：同一 prompt 换模型就是另一个结果，静默复用是错的。
+- **出现序号每次尝试都从 0 重数**，不从台账 seed——否则键全部偏移，整个缓存一条都命中不了。哈希相同的两个调用本就可互换，所以谁拿到 0 号无关紧要。
+- 同键多条（某次尝试失败后重跑）按 seq 顺序后来者覆盖前者；**后来的失败会抹掉先前的成功**，否则会复用一个已被证伪的结果。
+
+已知限制（记录在案，不是遗漏）：
+
+1. prompt 里嵌时间戳之类的易变内容 → 哈希变化 → 缓存未命中 → 重跑。降级是安全方向。
+2. **读依赖不追踪**：一个只读调用的答案可能依赖某个文件内容，而该文件之后变了——任何不做读取插桩的重放系统都无法发现。写依赖通过 git 状态覆盖。
+3. 并发调用共享同一个 cwd（即规格 V8 那个问题），A 的 `after` 可能包含 B 的写入。效果是**保守作废**（多跑），不会静默复用。
+
 ### 4.2 Ledger 记录
 
 ```ts
@@ -487,13 +509,14 @@ interface ProcedureMeta {
 | `runner.ts` `AgentOutcome` | ✅ 加 `failure: FailureInfo` 与 `retries: RetryObservation[]`；订阅 `auto_retry_*` 并通过 `onRetry` 早报限流 |
 | `runner.ts` `SessionManager.inMemory(options.cwd)` | 换成持久化 SessionManager；同仓已有先例 `extensions/subagents/src/backends/pi.ts:290` 的 `SessionManager.create(task.cwd)`。顺带可借用 `extensions/subagents/src/ui/takeover.ts` 实现子 agent 接管 |
 | `runner.ts` `FIRST_RESPONSE_TIMEOUT_MS`（45s）、工具 3 分钟超时 | 支持按步骤覆盖；跑测试的 implement 步骤必然顶满默认值 |
-| `sandbox.ts` `onAgent` | 包一层 ledger 查表：命中直接返回，未命中才真跑。约 40 行 |
-| `sandbox.ts` `MAX_AGENT_REQUESTS` / `controller.ts` `MAX_AGENT_CALLS` | 由"单次 run 计数"改为"计划级预算 + 跨恢复持久化"（§4.4） |
+| `index.ts` `agentFn` | ✅ 模型解析与台账查表**上移到 `controller.schedule` 之前**——命中不占预算也不占并发槽，而且非法模型名也不再消耗预算；未命中才真跑，settle 后写台账 |
+| `sandbox.ts` `MAX_AGENT_REQUESTS` / `controller.ts` `MAX_AGENT_CALLS` | ✅ 二者分家：IPC 上限提到 64（恢复时脚本会重放全部调用，含命中的），真实花费仍由 `MAX_AGENT_CALLS=32` 封顶，并通过 `RunController` 的 `initialCalls` 跨恢复累计 |
 | `controller.ts` `Semaphore` | ✅ 加 `setLimit()`（只放大时放行队列，缩小不杀在途）；`schedule()` 在取信号量前 `await governor.wait()`；导出 `MAX_CONCURRENCY` |
 | `model.ts` `WorkflowStatus` | ✅ 已加 `throttled`（含 `statusSquare` / `statusColor` 分支、`AgentRecord.failure`/`.retries`、`WorkflowDetails.throttle`）；`suspended` / `awaiting-input` / `awaiting-parent` / `replan-required` 待 M2–M4 |
 | `index.ts:395` `background = (params.background ?? false) && ctx.hasUI` | 加 headless 执行路径：`mode: "detached"` 不依赖 `hasUI` |
 | `index.ts:294` `session_shutdown` 全量 abort | detached run 改为**落盘后脱离**而非 abort；会话结束不杀 detached run（本版最小实现：落盘 + 下次会话可恢复；常驻 supervisor 属 N1） |
-| `artifacts.ts` | 新增 ledger / blockers / assumptions 的原子追加写；复用现有 `writeFileAtomic` 与节流 checkpoint |
+| `ledger.ts` / `worktree.ts` | ✅ 新增。注意 `safeStringify` 是缩进 2 的 pretty-print，**不能**用于 JSONL；台账自己用 `toSerializable` + 无缩进 `JSON.stringify`。`before`/`after` 会重建成全新普通对象——共享引用会被序列化器换成 `"[circular]"` 标记，而复用判定正依赖这两个字段 |
+| `artifacts.ts` | blockers / assumptions 的原子追加写待 M4 |
 | `prompt.ts` | 重写工具描述；移除 "ultracode" 口令闸门；新增 plan/report/answer 的模型面文档 |
 | `dashboard.ts` | ✅ `throttled` 纳入状态收窄与陈旧 run 回收——此前一个持久化为 `throttled` 的死 run 会被显示成 `completed` |
 
@@ -504,8 +527,8 @@ interface ProcedureMeta {
 | M | 内容 | 验收 |
 | --- | --- | --- |
 | **M1** ✅ | 错误分类 + 重试观测 + RateLimitGovernor | **已完成。** `failure.ts` 分类（10 个测试，含"配额 429 不得当节流"）、`governor.ts` 节流治理（10 个测试，含窗口只延不缩、AIMD 回升、`wait` 的中断语义）、`controller.ts` 的准入闸门（4 个测试：节流期间零启动、在途不受扰、成功后重开槽位）、`runner.ts` 的 `recordRetryObservation`（4 个测试）。步骤级再尝试与 ledger 记账随 M2 落地 |
-| **M2** | Ledger + 恢复 | 5 步计划在第 3 步杀进程；恢复后只跑 3–5 步，步骤 1–2 的 agent 调用数为 0；`budgetUsed` 跨恢复累计正确 |
-| **M3** | git SHA 钉住与传递作废 | 恢复前外部改动 HEAD：`effects != readonly` 的步骤被作废，其下游亦被作废；`readonly` 步骤保留 |
+| **M2** ✅ | Ledger + 恢复 | **已完成。** `ledger.ts`（内容寻址键 + append-only JSONL + 重放判定，19 个测试）、`worktree.ts`（git 探针，9 个测试）、`workflow` 工具的 `resume` 参数、预算跨恢复累计。场景测试覆盖"杀在第 3 步 → 恢复只跑 3–5 → 前两步零调用 → 预算累计到 5"。**工具层集成本身无自动化测试**（需真实运行时），覆盖的是它依赖的台账契约 |
+| **M3** 🟡 | git SHA 钉住与传递作废 | **核心已随 M2 落地**（不这样做 M2 本身就不安全）：写过的调用钉住 `after` 状态，不匹配即作废，并沿 seq 顺序传递作废；可证明只读的调用（前后都干净且 HEAD 未动）豁免。**剩余**：精确传递作废需要 Plan IR 的 `blockedBy`——当前只能按"其后全部"这一保守近似 |
 | **M4** | L1/L2/L3 + 通知送达 + 回答消费 | AFK run 触发 L3：状态 `awaiting-input`，blocker 文件完整（含 recommendation 与 choices），通知送达被记录；`workflow_answer` 后恢复并越过该步 |
 | **M5** | Plan IR + 校验器 | V1–V10 各有一个失败 fixture 被拒绝，并给出可读原因；合法计划通过 |
 | **M6** | matt-pocock provider 适配器（方案 A）+ 闸门 schema | **单张 AFK ticket 端到端**：澄清 → 一份 agent brief → implement → code-review → handoff，全程零 ask，闸门生效 |
@@ -537,4 +560,6 @@ interface ProcedureMeta {
 7. 没有一条成功送达记录的 L3 不算有效挂起。
 8. 全部 run 状态可由外部进程仅凭磁盘读取重建（为 N1 留门）。
 9. 引擎不改写用户的全局设置文件；不合意的设置只提示，不代劳。
+11. 台账命中不消耗预算、不占并发槽。
+12. 同一个 run 目录同时只能有一个活动 run 在写。
 10. 不在 SDK 已有重试之上叠加步骤内重试。

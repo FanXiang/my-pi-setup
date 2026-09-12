@@ -21,7 +21,7 @@
  * transcripts use separate artifacts, and there is no resume.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -39,6 +39,17 @@ import { MAX_CONCURRENCY, RunController } from "./controller.ts";
 import { sessionWorkflowRunIds, showWorkflowDashboard } from "./dashboard.ts";
 import { formatThrottle, RateLimitGovernor } from "./governor.ts";
 import {
+  agentInputHash,
+  describeReplay,
+  ledgerKey,
+  LedgerWriter,
+  OccurrenceCounter,
+  readLedger,
+  replayLedger,
+  type LedgerEntry,
+  type ReplayState,
+} from "./ledger.ts";
+import {
   extractMeta,
   prepareWorkflowScript,
   type WorkflowMeta,
@@ -52,6 +63,7 @@ import {
   formatUsage,
   phaseGroups,
   resultJson,
+  shortenHome,
   stateSquare,
   statusColor,
   statusWord,
@@ -77,6 +89,7 @@ import {
 } from "./runner.ts";
 import { runWorkflowSandbox } from "./sandbox.ts";
 import { safeStringify, writeFileAtomic } from "./serialization.ts";
+import { readWorktreeState, type WorktreeState } from "./worktree.ts";
 
 const PREVIEW_LENGTH = 200;
 const EMIT_INTERVAL_MS = 120;
@@ -122,6 +135,11 @@ const WorkflowParams = Type.Object({
       description: WORKFLOW_PARAMETER_DESCRIPTIONS.background,
     }),
   ),
+  resume: Type.Optional(
+    Type.String({
+      description: WORKFLOW_PARAMETER_DESCRIPTIONS.resume,
+    }),
+  ),
 });
 
 type WorkflowInput = Static<typeof WorkflowParams>;
@@ -139,13 +157,65 @@ function summaryLine(details: WorkflowDetails): string {
   const throttle = details.throttle
     ? formatThrottle(details.throttle)
     : undefined;
+  const reused = details.agents.filter((agent) => agent.reused).length;
   return `workflow ${details.name ?? details.runId}: ${settled}/${details.agents.length} agents${
-    details.currentPhase ? ` · ${details.currentPhase}` : ""
-  }${throttle ? ` · ${throttle}` : ""}`;
+    reused > 0 ? ` (${reused} reused)` : ""
+  }${details.currentPhase ? ` · ${details.currentPhase}` : ""}${
+    throttle ? ` · ${throttle}` : ""
+  }`;
 }
 
 function writeRunFile(runDir: string, name: string, content: string) {
   writeFileAtomic(path.join(runDir, name), content);
+}
+
+function scriptHashOf(script: string): string {
+  return createHash("sha256").update(script).digest("hex").slice(0, 32);
+}
+
+interface PriorRun {
+  runId: string;
+  runDir: string;
+  attempt: number;
+  entries: LedgerEntry[];
+  skipped: number;
+}
+
+/**
+ * Load the run a resume continues, refusing anything that would make reuse
+ * unsound. The recorded script is the run's contract: answering a different
+ * script's calls from this ledger would hand back results for work nobody
+ * asked for, so a mismatch starts a new run instead.
+ */
+function loadPriorRun(runId: string, script: string): PriorRun {
+  if (!/^wf_[0-9a-f]{6,}$/.test(runId)) {
+    throw new Error(`Cannot resume "${runId}": not a workflow run id.`);
+  }
+  const runDir = path.join(getAgentDir(), "workflows", runId);
+  let recordedScript: string;
+  try {
+    recordedScript = fs.readFileSync(path.join(runDir, "script.js"), "utf8");
+  } catch {
+    throw new Error(
+      `Cannot resume ${runId}: its script was not found under ${shortenHome(runDir)}.`,
+    );
+  }
+  if (scriptHashOf(recordedScript) !== scriptHashOf(script)) {
+    throw new Error(
+      `Cannot resume ${runId}: the script differs from the one it recorded. Start a new run instead.`,
+    );
+  }
+  let attempt = 1;
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(path.join(runDir, "workflow.json"), "utf8"),
+    ) as Partial<WorkflowDetails>;
+    attempt = Math.max(1, parsed.attempt ?? 1);
+  } catch {
+    // An unreadable summary still leaves the ledger usable.
+  }
+  const { entries, skipped } = readLedger(runDir);
+  return { runId, runDir, attempt, entries, skipped };
 }
 
 function compactToolDetails(details: WorkflowDetails): WorkflowDetails {
@@ -394,9 +464,32 @@ export default function workflows(pi: ExtensionAPI) {
       }
 
       const meta = prepared.meta;
-      const runId = `wf_${randomBytes(6).toString("hex")}`;
-      const runDir = path.join(getAgentDir(), "workflows", runId);
+      const prior =
+        params.resume === undefined
+          ? undefined
+          : loadPriorRun(params.resume, params.script);
+      if (prior && activeRuns.has(prior.runId)) {
+        // Two runs appending to one ledger would interleave their records and
+        // leave neither resumable.
+        throw new Error(
+          `Workflow ${prior.runId} is still running; wait for it or stop it before resuming.`,
+        );
+      }
+      const runId = prior?.runId ?? `wf_${randomBytes(6).toString("hex")}`;
+      const runDir =
+        prior?.runDir ?? path.join(getAgentDir(), "workflows", runId);
       const background = (params.background ?? false) && ctx.hasUI;
+
+      // The tree is probed once, before anything runs: every recorded call is
+      // judged against the same baseline this attempt starts from.
+      const baseline = prior ? await readWorktreeState(ctx.cwd) : undefined;
+      const replay: ReplayState | undefined = prior
+        ? replayLedger({
+            entries: prior.entries,
+            skipped: prior.skipped,
+            worktree: baseline,
+          })
+        : undefined;
 
       const details: WorkflowDetails = {
         runId,
@@ -405,6 +498,20 @@ export default function workflows(pi: ExtensionAPI) {
         description: meta.description,
         background,
         status: "running",
+        attempt: (prior?.attempt ?? 0) + 1,
+        scriptHash: scriptHashOf(params.script),
+        budgetUsed: prior?.entries.length ?? 0,
+        ...(replay
+          ? {
+              replay: {
+                reusable: replay.reusable.size,
+                invalidated: replay.invalidated.length,
+                failed: replay.entries.filter((e) => e.status === "failed")
+                  .length,
+                skipped: replay.skipped,
+              },
+            }
+          : {}),
         startedAt: Date.now(),
         phases: [...meta.phases],
         agents: [],
@@ -416,6 +523,9 @@ export default function workflows(pi: ExtensionAPI) {
       persistWorkflowJson(runDir, details);
       const persistence = createWorkflowPersistence(runDir, details);
 
+      const occurrences = new OccurrenceCounter();
+      const ledger = new LedgerWriter(runDir, prior?.entries.at(-1)?.seq ?? 0);
+
       // Background runs survive Esc on the parent turn, but all runs are
       // aborted and settled during session shutdown.
       const governor = new RateLimitGovernor(MAX_CONCURRENCY);
@@ -423,6 +533,7 @@ export default function workflows(pi: ExtensionAPI) {
         background ? undefined : signal,
         MAX_CONCURRENCY,
         governor,
+        prior?.entries.length ?? 0,
       );
 
       // Each concurrent child gets its own extension runtime. All children use
@@ -539,60 +650,96 @@ export default function workflows(pi: ExtensionAPI) {
         if (controller.signal.aborted)
           return fail("Workflow was aborted before this agent started");
 
+        // Resolve the selection before scheduling: a rejected model should not
+        // spend budget, and the ledger key depends on the resolved model.
+        let model: WorkflowModel | undefined = ctx.model;
+        if (opts.model !== undefined || opts.provider !== undefined) {
+          const modelOpt =
+            typeof opts.model === "string" ? opts.model : undefined;
+          const providerOpt =
+            typeof opts.provider === "string" ? opts.provider : undefined;
+          if (!modelOpt)
+            return fail(
+              `agent "${label}": \`provider\` requires \`model\` as well`,
+            );
+          let resolved: WorkflowModel | undefined;
+          if (providerOpt) {
+            resolved = ctx.modelRegistry.find(providerOpt, modelOpt);
+          } else {
+            const slash = modelOpt.indexOf("/");
+            if (slash > 0) {
+              resolved = ctx.modelRegistry.find(
+                modelOpt.slice(0, slash),
+                modelOpt.slice(slash + 1),
+              );
+            }
+            resolved ??= ctx.modelRegistry
+              .getAll()
+              .find((m) => m.id === modelOpt);
+          }
+          if (!resolved) {
+            const requested = providerOpt
+              ? `${providerOpt}/${modelOpt}`
+              : modelOpt;
+            return fail(
+              `agent "${label}": unknown model "${requested}" (use provider/id)`,
+            );
+          }
+          model = resolved;
+        }
+        record.model = model?.id;
+        record.contextWindow = model?.contextWindow;
+
+        // Effort → thinking level; default inherits the parent session.
+        let thinkingLevel: ThinkingLevel = pi.getThinkingLevel();
+        if (opts.effort !== undefined) {
+          const effort = String(opts.effort);
+          if (!(THINKING_LEVELS as readonly string[]).includes(effort)) {
+            return fail(
+              `agent "${label}": invalid effort "${effort}" (use ${THINKING_LEVELS.join("|")})`,
+            );
+          }
+          thinkingLevel = effort as ThinkingLevel;
+        }
+
+        // Content-addressed ledger key. Occurrence numbering follows this
+        // attempt's invocation order, which is what makes a replayed call line
+        // up with the one it is reusing.
+        const inputHash = agentInputHash({
+          prompt,
+          ...(opts.schema === undefined ? {} : { schema: opts.schema }),
+          ...(model?.id === undefined ? {} : { model: model.id }),
+          ...(model?.provider === undefined
+            ? {}
+            : { provider: model.provider }),
+          ...(thinkingLevel === undefined ? {} : { effort: thinkingLevel }),
+        });
+        const occurrence = occurrences.next(inputHash);
+        const key = ledgerKey(inputHash, occurrence);
+
+        const cached = replay?.reusable.get(key);
+        if (cached) {
+          record.state = "done";
+          record.reused = true;
+          record.usage = cached.usage;
+          record.model = cached.model ?? record.model;
+          record.contextWindow = cached.contextWindow ?? record.contextWindow;
+          record.preview = (cached.output ?? "").slice(0, PREVIEW_LENGTH);
+          record.finishedAt = Date.now();
+          emit();
+          return {
+            ok: true,
+            output: cached.output ?? "",
+            ...(cached.structured !== undefined
+              ? { structured: cached.structured }
+              : {}),
+          };
+        }
+
         return controller
           .schedule(async (runSignal) => {
-            // Model/provider resolution: default to the parent session's model.
-            let model: WorkflowModel | undefined = ctx.model;
-            if (opts.model !== undefined || opts.provider !== undefined) {
-              const modelOpt =
-                typeof opts.model === "string" ? opts.model : undefined;
-              const providerOpt =
-                typeof opts.provider === "string" ? opts.provider : undefined;
-              if (!modelOpt)
-                return fail(
-                  `agent "${label}": \`provider\` requires \`model\` as well`,
-                );
-              let resolved: WorkflowModel | undefined;
-              if (providerOpt) {
-                resolved = ctx.modelRegistry.find(providerOpt, modelOpt);
-              } else {
-                const slash = modelOpt.indexOf("/");
-                if (slash > 0) {
-                  resolved = ctx.modelRegistry.find(
-                    modelOpt.slice(0, slash),
-                    modelOpt.slice(slash + 1),
-                  );
-                }
-                resolved ??= ctx.modelRegistry
-                  .getAll()
-                  .find((m) => m.id === modelOpt);
-              }
-              if (!resolved) {
-                const requested = providerOpt
-                  ? `${providerOpt}/${modelOpt}`
-                  : modelOpt;
-                return fail(
-                  `agent "${label}": unknown model "${requested}" (use provider/id)`,
-                );
-              }
-              model = resolved;
-            }
-            record.model = model?.id;
-            record.contextWindow = model?.contextWindow;
             emit();
-
-            // Effort → thinking level; default inherits the parent session.
-            let thinkingLevel: ThinkingLevel = pi.getThinkingLevel();
-            if (opts.effort !== undefined) {
-              const effort = String(opts.effort);
-              if (!(THINKING_LEVELS as readonly string[]).includes(effort)) {
-                return fail(
-                  `agent "${label}": invalid effort "${effort}" (use ${THINKING_LEVELS.join("|")})`,
-                );
-              }
-              thinkingLevel = effort as ThinkingLevel;
-            }
-
+            const before = await readWorktreeState(ctx.cwd);
             const resources = await getResources(opts.schema !== undefined);
             const outcome = await runAgent({
               prompt,
@@ -649,6 +796,45 @@ export default function workflows(pi: ExtensionAPI) {
               } else {
                 governor.noteFailure();
               }
+            }
+
+            // Record the call before returning it to the script, so a process
+            // killed on the next line still leaves this work recoverable.
+            const after = await readWorktreeState(ctx.cwd);
+            try {
+              ledger.append({
+                key,
+                inputHash,
+                occurrence,
+                label,
+                ...(record.phase === undefined ? {} : { phase: record.phase }),
+                status: outcome.ok ? "ok" : "failed",
+                startedAt: record.startedAt,
+                finishedAt: record.finishedAt,
+                before,
+                after,
+                ...(outcome.output ? { output: outcome.output } : {}),
+                ...(outcome.structured === undefined
+                  ? {}
+                  : { structured: outcome.structured }),
+                ...(outcome.failure === undefined
+                  ? {}
+                  : { failure: outcome.failure }),
+                usage: outcome.usage,
+                ...(outcome.model === undefined
+                  ? {}
+                  : { model: outcome.model }),
+                ...(outcome.contextWindow === undefined
+                  ? {}
+                  : { contextWindow: outcome.contextWindow }),
+              });
+              details.budgetUsed = (details.budgetUsed ?? 0) + 1;
+            } catch (error) {
+              // A run that cannot record is a run that cannot resume; say so
+              // rather than finishing and silently losing the ability.
+              details.error =
+                details.error ??
+                `Ledger append failed: ${errorText(error)}; this run cannot be resumed`;
             }
             emit();
 

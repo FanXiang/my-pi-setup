@@ -13,6 +13,8 @@ export const WORKFLOW_PARAMETER_DESCRIPTIONS = {
   args: "Optional JSON string exposed to the script as `args` (parsed when valid JSON, otherwise passed through as the raw string).",
   background:
     "Run in the background: the tool returns a run id immediately and you receive a follow-up message when the workflow finishes. Defaults to false (blocking with live progress).",
+  resume:
+    "Run id of a previous run to continue. Pass the same `script` and `args`: every agent call that already settled is answered from that run's ledger instead of being paid for again, and only unfinished or invalidated work runs. A script that does not match the recorded one is rejected rather than resumed.",
 };
 
 /** Defines the workflow DSL, constraints, reliability guidance, and model-authored task examples. */
@@ -26,7 +28,7 @@ export const WORKFLOW_TOOL_DESCRIPTION = [
   "• await parallel([() => agent(...), () => agent(...)], { concurrency? }) — run zero-argument agent thunks concurrently and return results in order. Concurrency is globally capped at 4 for the run.",
   "• args — the parsed value of the `args` tool parameter (or undefined).",
   "Workflow JavaScript runs in a restricted, killable child with no imports, eval, timers, filesystem, network, or process APIs. A run may make at most 32 agent calls and has no overall deadline. Each agent must receive its first assistant response event within 45 seconds so silent provider requests fail clearly; after that, agent() has no wall-clock deadline. Each individual child tool call times out independently after 3 minutes, becomes an error tool result, and leaves the agent loop free to recover. Use map/filter/if/await/template strings to orchestrate, and `return` a JSON-serializable aggregate.",
-  "Pass a `schema` to agent() whenever a later step branches on the result, so you get typed fields instead of prose. There is no resume: a failed run is simply re-run. Artifacts are saved under ~/.pi/agent/workflows/<runId>/ for inspection.",
+  "Pass a `schema` to agent() whenever a later step branches on the result, so you get typed fields instead of prose. A failed or interrupted run can be continued with the `resume` parameter: settled agent calls are answered from the run's ledger, so only the unfinished work costs anything. Artifacts are saved under ~/.pi/agent/workflows/<runId>/ for inspection.",
   "Example:",
   "export const meta = { name: 'reliability-review', description: 'Review modules for reliability risks, then report', phases: [{ title: 'Scan' }, { title: 'Report' }] }",
   "const FINDINGS = { type: 'object', properties: { issues: { type: 'array', items: { type: 'string' } }, ok: { type: 'boolean' } }, required: ['issues', 'ok'] }",
@@ -68,12 +70,24 @@ export function buildWorkflowResultMessage(
 ) {
   const { done, failed } = countStates(details);
   const elapsed = formatElapsed(details.startedAt, details.finishedAt);
+  const reused = details.agents.filter((agent) => agent.reused).length;
   const lines = [
     `Workflow ${details.name ? `"${details.name}"` : details.runId} ${details.status} — ` +
-      `${done}/${details.agents.length} agents ok${failed ? `, ${failed} failed` : ""} ` +
+      `${done}/${details.agents.length} agents ok${failed ? `, ${failed} failed` : ""}` +
+      `${reused ? `, ${reused} reused from the ledger` : ""} ` +
       `across ${details.phases.length} phase(s) in ${elapsed}.`,
     `Run dir: ${shortenHome(runDir)}`,
   ];
+  if ((details.attempt ?? 1) > 1) {
+    lines.push(
+      `Attempt ${details.attempt} (resumed); ${details.budgetUsed ?? 0} agent call(s) charged in total.`,
+    );
+  }
+  if (details.replay && details.replay.invalidated > 0) {
+    lines.push(
+      `${details.replay.invalidated} recorded call(s) were invalidated because the worktree moved, and ran again.`,
+    );
+  }
   if (details.error) lines.push(`Error: ${details.error}`);
   if (details.agents.length > 0) {
     lines.push("", "Agents:");

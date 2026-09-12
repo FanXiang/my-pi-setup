@@ -81,6 +81,8 @@ export interface AgentRecord {
   error?: string;
   /** Classified cause, for failed agents. */
   failure?: FailureInfo;
+  /** True when the result came from the ledger instead of a new agent. */
+  reused?: boolean;
   /** Session-level auto-retries this agent went through. */
   retries?: number;
   preview: string;
@@ -97,6 +99,19 @@ export interface WorkflowDetails {
   description?: string;
   background: boolean;
   status: WorkflowStatus;
+  /** 1 for a fresh run, incremented by each resume. */
+  attempt?: number;
+  /** Hash of the script this run is pinned to; a resume must match it. */
+  scriptHash?: string;
+  /** Agent calls charged so far, including earlier attempts. */
+  budgetUsed?: number;
+  /** What the resume was able to reuse. */
+  replay?: {
+    reusable: number;
+    invalidated: number;
+    failed: number;
+    skipped: number;
+  };
   startedAt: number;
   finishedAt?: number;
   phases: { title: string; detail?: string }[];

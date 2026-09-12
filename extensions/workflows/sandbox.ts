@@ -8,7 +8,13 @@ const MAX_SOURCE_BYTES = 512 * 1024;
 const MAX_ARGS_BYTES = 256 * 1024;
 const MAX_RESULT_BYTES = 1024 * 1024;
 const MAX_AGENT_MESSAGE_BYTES = 512 * 1024;
-const MAX_AGENT_REQUESTS = 32;
+/**
+ * Runaway guard on IPC volume, not a cost budget. A resumed run replays every
+ * call the script makes, including the ones answered from the ledger, so this
+ * has to sit above the run's agent-call budget; actual spend stays capped by
+ * `MAX_AGENT_CALLS` in the controller.
+ */
+const MAX_AGENT_REQUESTS = 64;
 
 export interface SandboxAgentOptions {
   label?: unknown;

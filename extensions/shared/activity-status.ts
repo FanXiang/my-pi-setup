@@ -6,6 +6,8 @@ interface ActivityCounts {
   running: number;
   done: number;
   failed: number;
+  /** Stopped on a person. Counted apart from failed, because it is not one. */
+  waiting?: number;
 }
 
 const SQUARE = "■";
@@ -18,6 +20,9 @@ export function formatActivityStatus(
   const parts: string[] = [];
   if (counts.running > 0) {
     parts.push(theme.fg("warning", `${SQUARE} ${counts.running} running`));
+  }
+  if (counts.waiting && counts.waiting > 0) {
+    parts.push(theme.fg("warning", `${SQUARE} ${counts.waiting} needs you`));
   }
   if (counts.done > 0) {
     parts.push(theme.fg("success", `${SQUARE} ${counts.done} done`));

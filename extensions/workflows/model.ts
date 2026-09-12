@@ -9,6 +9,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { formatContextUtilization } from "../shared/context-utilization.ts";
+import type { Assumption, Blocker, Flag, Replan } from "./escalation.ts";
 import type { FailureInfo } from "./failure.ts";
 import type { GovernorSnapshot } from "./governor.ts";
 import { safeStringify } from "./serialization.ts";
@@ -45,9 +46,18 @@ export type WorkflowStatus =
   | "running"
   /** Running, but holding new agents back until a provider throttle clears. */
   | "throttled"
+  /** Stopped on an Attention Request; a person has to answer before it moves. */
+  | "awaiting-input"
   | "completed"
+  /** Ended because the plan is wrong: an answer would not unblock it. */
+  | "replan-required"
   | "failed"
   | "aborted";
+
+/** Statuses a run can still leave on its own. */
+export function isLiveStatus(status: WorkflowStatus): boolean {
+  return status === "running" || status === "throttled";
+}
 
 export type TranscriptRole =
   "user" | "assistant" | "thinking" | "tool" | "toolResult";
@@ -119,6 +129,14 @@ export interface WorkflowDetails {
   agents: AgentRecord[];
   /** Latest throttle state, when the run uses a governor. */
   throttle?: GovernorSnapshot;
+  /** L1 records: what the run proceeded on instead of asking. */
+  assumptions?: Assumption[];
+  /** L2 records: things the reader must see. */
+  flags?: Flag[];
+  /** The Attention Request this run stopped on, when it stopped on one. */
+  blocker?: Blocker;
+  /** Why the run ended asking to be replanned. */
+  replan?: Replan;
   result?: unknown;
   resultArtifact?: string;
   transcriptArtifact?: string;
@@ -135,21 +153,29 @@ export function stateSquare(state: AgentState, theme: Theme): string {
 }
 
 export function statusSquare(status: WorkflowStatus, theme: Theme): string {
-  if (status === "completed") return theme.fg("success", SQUARE);
-  if (status === "running" || status === "throttled")
-    return theme.fg("warning", SQUARE);
-  return theme.fg("error", SQUARE);
+  return theme.fg(statusColor(status), SQUARE);
 }
 
 export function statusWord(status: WorkflowStatus): string {
-  return status === "completed" ? "done" : status;
+  if (status === "completed") return "done";
+  // Named for the reader, not the state machine: a run stopped on a person
+  // must not read like one that is still working.
+  if (status === "awaiting-input") return "needs you";
+  if (status === "replan-required") return "needs replanning";
+  return status;
 }
 
 export function statusColor(
   status: WorkflowStatus,
 ): "success" | "warning" | "error" {
   if (status === "completed") return "success";
-  if (status === "running" || status === "throttled") return "warning";
+  if (
+    status === "running" ||
+    status === "throttled" ||
+    status === "awaiting-input"
+  ) {
+    return "warning";
+  }
   return "error";
 }
 

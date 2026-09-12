@@ -8,6 +8,10 @@ const MAX_SOURCE_BYTES = 512 * 1024;
 const MAX_ARGS_BYTES = 256 * 1024;
 const MAX_RESULT_BYTES = 1024 * 1024;
 const MAX_AGENT_MESSAGE_BYTES = 512 * 1024;
+const MAX_ESCALATION_MESSAGE_BYTES = 16 * 1024;
+/** Runaway guards on script-raised records; the engine caps what it keeps. */
+const MAX_ESCALATION_RECORDS = 400;
+const MAX_BLOCK_REQUESTS = 16;
 /**
  * Runaway guard on IPC volume, not a cost budget. A resumed run replays every
  * call the script makes, including the ones answered from the ledger, so this
@@ -32,6 +36,13 @@ export interface SandboxAgentResult {
   error?: string;
 }
 
+/** Answer handed back to a `block()` that a person has already resolved. */
+export interface SandboxBlockResult {
+  choice: string;
+  note?: string;
+  answeredAt: number;
+}
+
 export interface RunWorkflowSandboxOptions {
   source: string;
   args: unknown;
@@ -43,6 +54,18 @@ export interface RunWorkflowSandboxOptions {
     signal: AbortSignal,
   ) => Promise<SandboxAgentResult>;
   onPhase: (title: string) => void;
+  /** L1: record an assumption and let the script continue. */
+  onAssume: (input: unknown) => void;
+  /** L2: record something the reader must see, without stopping. */
+  onFlag: (input: unknown) => void;
+  /** Ends the run because the plan is wrong; the script is not resumed. */
+  onReplan: (input: unknown) => void;
+  /**
+   * L3. Resolves with an answer a person already gave, or `undefined` to leave
+   * the call unanswered because the run is suspending - the host aborts, and
+   * a later resume replays the script up to this point.
+   */
+  onBlock: (input: unknown) => Promise<SandboxBlockResult | undefined>;
 }
 
 function byteLength(value: string) {
@@ -132,6 +155,8 @@ export function runWorkflowSandbox(options: RunWorkflowSandboxOptions) {
     const requestIds = new Set<number>();
     const activeAgentRequests = new Map<number, AbortController>();
     let requestCount = 0;
+    let recordCount = 0;
+    let blockCount = 0;
     let finished = false;
 
     const cleanup = () => {
@@ -196,6 +221,101 @@ export function runWorkflowSandbox(options: RunWorkflowSandboxOptions) {
         } catch {
           finish(new Error("Workflow sandbox sent an invalid phase update"));
         }
+        return;
+      }
+      if (
+        raw.kind === "assume" ||
+        raw.kind === "flag" ||
+        raw.kind === "replan"
+      ) {
+        if (
+          typeof raw.payloadJson !== "string" ||
+          byteLength(raw.payloadJson) > MAX_ESCALATION_MESSAGE_BYTES
+        ) {
+          finish(
+            new Error(`Workflow sandbox sent an oversized ${raw.kind} record`),
+          );
+          return;
+        }
+        if (raw.kind !== "replan" && ++recordCount > MAX_ESCALATION_RECORDS) {
+          finish(
+            new Error(
+              "Workflow sandbox exceeded its assume/flag record budget",
+            ),
+          );
+          return;
+        }
+        let payload: unknown;
+        try {
+          payload = JSON.parse(raw.payloadJson);
+        } catch {
+          finish(new Error(`Workflow sandbox sent malformed ${raw.kind} JSON`));
+          return;
+        }
+        if (!isRecord(payload)) {
+          finish(
+            new Error(`Workflow sandbox sent an invalid ${raw.kind} record`),
+          );
+          return;
+        }
+        try {
+          if (raw.kind === "assume") options.onAssume(payload.input);
+          else if (raw.kind === "flag") options.onFlag(payload.input);
+          else options.onReplan(payload.input);
+        } catch (error) {
+          // Validation rejected the record: the script broke the contract, so
+          // the run fails rather than continuing with a half-recorded decision.
+          finish(error instanceof Error ? error : new Error(errorText(error)));
+        }
+        return;
+      }
+      if (raw.kind === "block") {
+        if (
+          typeof raw.payloadJson !== "string" ||
+          byteLength(raw.payloadJson) > MAX_ESCALATION_MESSAGE_BYTES
+        ) {
+          finish(new Error("Workflow sandbox sent an oversized block request"));
+          return;
+        }
+        if (++blockCount > MAX_BLOCK_REQUESTS) {
+          finish(
+            new Error("Workflow sandbox exceeded its block request budget"),
+          );
+          return;
+        }
+        let payload: unknown;
+        try {
+          payload = JSON.parse(raw.payloadJson);
+        } catch {
+          finish(new Error("Workflow sandbox sent malformed block JSON"));
+          return;
+        }
+        if (
+          !isRecord(payload) ||
+          !Number.isSafeInteger(payload.id) ||
+          typeof payload.id !== "number" ||
+          payload.id < 1 ||
+          requestIds.has(payload.id)
+        ) {
+          finish(new Error("Workflow sandbox sent an invalid block request"));
+          return;
+        }
+        requestIds.add(payload.id);
+        const id = payload.id;
+        void options
+          .onBlock(payload.input)
+          .then((result) => {
+            // No result means the run is suspending: leaving the call
+            // unanswered is the suspension, and the host aborts the sandbox.
+            if (result === undefined || finished || !child.connected) return;
+            child.send({
+              token,
+              kind: "blockResult",
+              id,
+              resultJson: JSON.stringify(result),
+            });
+          })
+          .catch((error) => finish(new Error(errorText(error))));
         return;
       }
       if (raw.kind === "agent") {

@@ -121,6 +121,43 @@ const BOOTSTRAP = String.raw`
     callHost("phase", JSON.stringify({ title: String(title) }));
   }
 
+  function oneWay(kind, name) {
+    return (input) => {
+      let payload;
+      try {
+        payload = JSON.stringify({ input: input === undefined ? null : input });
+      } catch (error) {
+        throw new Error(name + "() arguments must be serializable: " + error.message);
+      }
+      callHost(kind, payload);
+    };
+  }
+
+  // Records an assumption and keeps going (L1).
+  const assume = oneWay("assume", "assume");
+  // Records something the reader must see, without stopping (L2).
+  const flag = oneWay("flag", "flag");
+  // Ends the run because the plan itself is wrong; never returns.
+  const replan = oneWay("replan", "replan");
+
+  /**
+   * Stops for a person (L3). On the attempt that raises it, the run is
+   * suspended and this never settles; a resumed run gets the answer.
+   */
+  function block(input) {
+    const id = ++nextRequestId;
+    let payload;
+    try {
+      payload = JSON.stringify({ id, input: input === undefined ? null : input });
+    } catch (error) {
+      return Promise.reject(new Error("block() arguments must be serializable: " + error.message));
+    }
+    inFlight.add(id);
+    return callHost("block", payload)
+      .then((json) => JSON.parse(json))
+      .finally(() => inFlight.delete(id));
+  }
+
   const argsEnvelope = JSON.parse(globalThis.__argsJson);
   const args = argsEnvelope.defined ? deepFreeze(argsEnvelope.value) : undefined;
   delete globalThis.__argsJson;
@@ -140,6 +177,10 @@ const BOOTSTRAP = String.raw`
     agent: { value: requestAgent, writable: false, configurable: false },
     parallel: { value: parallel, writable: false, configurable: false },
     phase: { value: phase, writable: false, configurable: false },
+    assume: { value: assume, writable: false, configurable: false },
+    flag: { value: flag, writable: false, configurable: false },
+    block: { value: block, writable: false, configurable: false },
+    replan: { value: replan, writable: false, configurable: false },
     args: { value: args, writable: false, configurable: false },
     __workflowCheck: {
       value: Object.freeze(() => ({
@@ -160,6 +201,7 @@ const BOOTSTRAP = String.raw`
 
 let initialized = false;
 let token;
+/** Outstanding agent() and block() requests, by request id. */
 const pendingAgents = new Map();
 
 function send(message) {
@@ -188,7 +230,11 @@ process.on("message", (message) => {
     run(message.source, message.argsJson);
     return;
   }
-  if (message.token !== token || message.kind !== "agentResult") return;
+  if (
+    message.token !== token ||
+    (message.kind !== "agentResult" && message.kind !== "blockResult")
+  )
+    return;
   const pending = pendingAgents.get(message.id);
   if (!pending) return;
   pendingAgents.delete(message.id);
@@ -207,21 +253,26 @@ function run(source, argsJson) {
     const sandbox = Object.create(null);
     sandbox.__argsJson = argsJson;
     sandbox.__hostBridge = (kind, payloadJson) => {
-      if (kind === "phase") {
-        send({ kind: "phase", payloadJson });
+      if (
+        kind === "phase" ||
+        kind === "assume" ||
+        kind === "flag" ||
+        kind === "replan"
+      ) {
+        send({ kind, payloadJson });
         return undefined;
       }
-      if (kind !== "agent")
+      if (kind !== "agent" && kind !== "block")
         return Promise.reject(new Error("Unknown workflow operation"));
       let id;
       try {
         id = JSON.parse(payloadJson).id;
       } catch {
-        return Promise.reject(new Error("Invalid agent request"));
+        return Promise.reject(new Error("Invalid " + kind + " request"));
       }
       return new Promise((resolve, reject) => {
         pendingAgents.set(id, { resolve, reject });
-        send({ kind: "agent", payloadJson });
+        send({ kind, payloadJson });
       });
     };
 

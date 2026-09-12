@@ -37,6 +37,27 @@ import { formatActivityStatus } from "../shared/activity-status.ts";
 import { createWorkflowPersistence, persistWorkflowJson } from "./artifacts.ts";
 import { MAX_CONCURRENCY, RunController } from "./controller.ts";
 import { sessionWorkflowRunIds, showWorkflowDashboard } from "./dashboard.ts";
+import {
+  appendAnswer,
+  appendAssumption,
+  appendFlag,
+  blockerHash,
+  blockerId,
+  describeBlocker,
+  normalizeAssumptionInput,
+  normalizeBlockerInput,
+  normalizeFlagInput,
+  normalizeReplanInput,
+  openBlockers,
+  readAnswers,
+  readAssumptions,
+  readBlocker,
+  readFlags,
+  writeBlocker,
+  writeReplan,
+  type Answer,
+  type Blocker,
+} from "./escalation.ts";
 import { formatThrottle, RateLimitGovernor } from "./governor.ts";
 import {
   agentInputHash,
@@ -49,6 +70,7 @@ import {
   type LedgerEntry,
   type ReplayState,
 } from "./ledger.ts";
+import { deliverBlocker, NEEDS_INPUT_FILE, wasDelivered } from "./notify.ts";
 import {
   extractMeta,
   prepareWorkflowScript,
@@ -62,6 +84,7 @@ import {
   formatElapsed,
   formatUsage,
   phaseGroups,
+  isLiveStatus,
   resultJson,
   shortenHome,
   stateSquare,
@@ -79,6 +102,7 @@ import {
   WORKFLOW_PARAMETER_DESCRIPTIONS,
   WORKFLOW_PROMPT_GUIDELINES,
   WORKFLOW_PROMPT_SNIPPET,
+  WORKFLOW_ANSWER_TOOL_DESCRIPTION,
   WORKFLOW_TOOL_DESCRIPTION,
 } from "./prompt.ts";
 import {
@@ -282,7 +306,7 @@ function listRuns(
         runId,
         name: parsed.name,
         status:
-          parsed.status === "running" || parsed.status === "throttled"
+          parsed.status && isLiveStatus(parsed.status)
             ? "aborted"
             : (parsed.status ?? "unknown"),
         done: agents.filter((agent) => agent.state !== "running").length,
@@ -333,12 +357,18 @@ export default function workflows(pi: ExtensionAPI) {
   let lastUi: ExtensionContext["ui"] | undefined;
   let completedRuns = 0;
   let failedRuns = 0;
+  let waitingRuns = 0;
   const updateIndicator = () => {
     const ui = lastUi;
     if (!ui) return;
     try {
       const running = activeRuns.size;
-      if (running === 0 && completedRuns === 0 && failedRuns === 0) {
+      if (
+        running === 0 &&
+        completedRuns === 0 &&
+        failedRuns === 0 &&
+        waitingRuns === 0
+      ) {
         ui.setStatus("workflows", undefined);
         return;
       }
@@ -348,6 +378,7 @@ export default function workflows(pi: ExtensionAPI) {
           running,
           done: completedRuns,
           failed: failedRuns,
+          waiting: waitingRuns,
         }),
       );
     } catch {
@@ -357,6 +388,9 @@ export default function workflows(pi: ExtensionAPI) {
 
   const recordSettledRun = (status: WorkflowDetails["status"]) => {
     if (status === "completed") completedRuns += 1;
+    // A run stopped on a person has not failed, and must not be reported as
+    // though it had: the two call for opposite responses.
+    else if (status === "awaiting-input") waitingRuns += 1;
     else failedRuns += 1;
   };
 
@@ -435,6 +469,84 @@ export default function workflows(pi: ExtensionAPI) {
       if (!choice) return;
       const run = runs[labels.indexOf(choice)];
       if (run) ctx.ui.notify(runDetailText(run, activeDetails()), "info");
+    },
+  });
+
+  const AnswerParams = Type.Object({
+    runId: Type.String({
+      description: WORKFLOW_PARAMETER_DESCRIPTIONS.answerRunId,
+    }),
+    blockerId: Type.String({
+      description: WORKFLOW_PARAMETER_DESCRIPTIONS.answerBlockerId,
+    }),
+    choice: Type.String({
+      description: WORKFLOW_PARAMETER_DESCRIPTIONS.answerChoice,
+    }),
+    note: Type.Optional(
+      Type.String({ description: WORKFLOW_PARAMETER_DESCRIPTIONS.answerNote }),
+    ),
+  });
+
+  pi.registerTool({
+    name: "workflow_answer",
+    label: "Answer Workflow",
+    description: WORKFLOW_ANSWER_TOOL_DESCRIPTION,
+    parameters: AnswerParams,
+
+    async execute(_toolCallId, params) {
+      const runId = params.runId.trim();
+      if (!/^wf_[0-9a-f]{6,}$/.test(runId)) {
+        throw new Error(`"${runId}" is not a workflow run id.`);
+      }
+      const runDir = path.join(getAgentDir(), "workflows", runId);
+      const blocker = readBlocker(runDir, params.blockerId.trim());
+      if (!blocker) {
+        throw new Error(
+          `Run ${runId} has no blocker ${params.blockerId}. Check ${shortenHome(path.join(runDir, NEEDS_INPUT_FILE))}.`,
+        );
+      }
+      const choice = params.choice.trim();
+      // The choices are the contract: an answer outside them is not a decision
+      // the run knows how to act on.
+      const matched = blocker.choices.find(
+        (candidate) => candidate.toLowerCase() === choice.toLowerCase(),
+      );
+      if (!matched) {
+        throw new Error(
+          `"${choice}" is not one of this blocker's choices: ${blocker.choices.join(" | ")}`,
+        );
+      }
+
+      const answer: Answer = {
+        id: blocker.id,
+        choice: matched,
+        ...(params.note?.trim() ? { note: params.note.trim() } : {}),
+        answeredAt: Date.now(),
+      };
+      appendAnswer(runDir, answer);
+
+      const remaining = openBlockers(runDir);
+      if (remaining.length === 0) {
+        try {
+          fs.rmSync(path.join(runDir, NEEDS_INPUT_FILE), { force: true });
+        } catch {
+          // The marker is a convenience; the answer is already recorded.
+        }
+      }
+      if (waitingRuns > 0) waitingRuns -= 1;
+      updateIndicator();
+
+      const lines = [
+        `Recorded "${matched}" for blocker ${blocker.id} of ${runId}.`,
+        ...(answer.note ? [`Note: ${answer.note}`] : []),
+        remaining.length > 0
+          ? `${remaining.length} blocker(s) still open on this run.`
+          : `Resume the run to continue past it: workflow resume=${runId} with the same script and args.`,
+      ];
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: { runId, blockerId: blocker.id, choice: matched },
+      };
     },
   });
 
@@ -526,6 +638,15 @@ export default function workflows(pi: ExtensionAPI) {
       const occurrences = new OccurrenceCounter();
       const ledger = new LedgerWriter(runDir, prior?.entries.at(-1)?.seq ?? 0);
 
+      // Escalation state. Answers are loaded up front, including for a fresh
+      // run, so a block that was already answered resolves without stopping.
+      const blockerOccurrences = new OccurrenceCounter();
+      const answers = readAnswers(runDir);
+      details.assumptions = prior ? readAssumptions(runDir) : [];
+      details.flags = prior ? readFlags(runDir) : [];
+      /** Set when the run stops on an Attention Request. */
+      let blocked: Blocker | undefined;
+
       // Background runs survive Esc on the parent turn, but all runs are
       // aborted and settled during session shutdown.
       const governor = new RateLimitGovernor(MAX_CONCURRENCY);
@@ -595,6 +716,97 @@ export default function workflows(pi: ExtensionAPI) {
         if (!details.phases.some((p) => p.title === text))
           details.phases.push({ title: text });
         emit();
+      };
+
+      /** Context an escalation is attributed to: the step, else the phase. */
+      const escalationContext = (input: unknown) => {
+        const step =
+          input && typeof input === "object" && !Array.isArray(input)
+            ? (input as Record<string, unknown>).step
+            : undefined;
+        return {
+          stepLabel:
+            typeof step === "string" && step.trim()
+              ? step.trim().slice(0, 160)
+              : (details.currentPhase ?? "script"),
+          ...(details.currentPhase === undefined
+            ? {}
+            : { phase: details.currentPhase }),
+        };
+      };
+
+      const assumeFn = (input: unknown) => {
+        const assumption = normalizeAssumptionInput(
+          input,
+          escalationContext(input),
+        );
+        appendAssumption(runDir, assumption);
+        (details.assumptions ??= []).push(assumption);
+        emit();
+      };
+
+      const flagFn = (input: unknown) => {
+        const flag = normalizeFlagInput(input, escalationContext(input));
+        appendFlag(runDir, flag);
+        (details.flags ??= []).push(flag);
+        emit();
+      };
+
+      const replanFn = (input: unknown) => {
+        const replan = normalizeReplanInput(input);
+        writeReplan(runDir, replan);
+        details.replan = replan;
+        emit();
+        // Nothing a person could answer would make this plan right, so the run
+        // ends here rather than waiting.
+        controller.abort("Workflow requires replanning");
+      };
+
+      /**
+       * L3. An answer already on record resolves the call; otherwise the run
+       * opens an Attention Request, makes sure somebody was told, and stops.
+       */
+      const blockFn = async (input: unknown) => {
+        const normalized = normalizeBlockerInput(
+          input,
+          escalationContext(input),
+        );
+        const hash = blockerHash(normalized);
+        const id = blockerId(hash, blockerOccurrences.next(hash));
+        const answer = answers.get(id);
+        if (answer) {
+          return {
+            choice: answer.choice,
+            ...(answer.note === undefined ? {} : { note: answer.note }),
+            answeredAt: answer.answeredAt,
+          };
+        }
+
+        const blocker: Blocker = {
+          ...normalized,
+          id,
+          openedAt: Date.now(),
+          notified: [],
+        };
+        blocker.notified = await deliverBlocker(blocker, {
+          runId,
+          runDir,
+          ...(ctx.hasUI ? { ui: ctx.ui } : {}),
+        });
+        writeBlocker(runDir, blocker);
+        blocked = blocker;
+        details.blocker = blocker;
+        if (!wasDelivered(blocker.notified)) {
+          // A pause nobody was told about looks like progress while nothing
+          // happens, so say so in the run's own error field.
+          details.error =
+            details.error ??
+            `Blocker ${id} could not be delivered on any channel; the run is waiting unannounced`;
+        }
+        emit();
+        controller.abort("Workflow is awaiting input");
+        // Unanswered: leaving the call open is the suspension.
+        return undefined;
       };
 
       let agentCounter = 0;
@@ -860,17 +1072,31 @@ export default function workflows(pi: ExtensionAPI) {
             signal: controller.signal,
             onAgent: agentFn,
             onPhase: phaseFn,
+            onAssume: assumeFn,
+            onFlag: flagFn,
+            onReplan: replanFn,
+            onBlock: blockFn,
           });
         } catch (error) {
-          details.error = errorText(error);
-          status = controller.signal.aborted ? "aborted" : "failed";
-          controller.abort("Workflow script failed");
+          if (blocked) {
+            // The script was aborted on purpose to suspend the run; the abort
+            // message is not the story, the Attention Request is.
+            status = "awaiting-input";
+          } else if (details.replan) {
+            status = "replan-required";
+          } else {
+            details.error = errorText(error);
+            status = controller.signal.aborted ? "aborted" : "failed";
+            controller.abort("Workflow script failed");
+          }
         }
 
+        const suspended =
+          status === "awaiting-input" || status === "replan-required";
         const settled = await controller.settle({
           abort: status !== "completed",
         });
-        if (!settled) {
+        if (!settled && !suspended) {
           status = "failed";
           details.error = details.error
             ? `${details.error}; agent shutdown deadline exceeded`
@@ -880,7 +1106,10 @@ export default function workflows(pi: ExtensionAPI) {
           if (record.state !== "running") continue;
           record.state = "error";
           record.error =
-            record.error ?? "Agent did not settle before run cleanup";
+            record.error ??
+            (suspended
+              ? "Agent was stopped when the run suspended"
+              : "Agent did not settle before run cleanup");
           record.finishedAt = Date.now();
         }
         unsubscribeGovernor();

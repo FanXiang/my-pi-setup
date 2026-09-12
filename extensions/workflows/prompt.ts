@@ -1,3 +1,4 @@
+import { describeBlocker } from "./escalation.ts";
 import {
   countStates,
   formatElapsed,
@@ -13,6 +14,12 @@ export const WORKFLOW_PARAMETER_DESCRIPTIONS = {
   args: "Optional JSON string exposed to the script as `args` (parsed when valid JSON, otherwise passed through as the raw string).",
   background:
     "Run in the background: the tool returns a run id immediately and you receive a follow-up message when the workflow finishes. Defaults to false (blocking with live progress).",
+  answerRunId: "Run id of the suspended workflow to answer.",
+  answerBlockerId:
+    "Blocker id from the workflow's Attention Request (also shown in the run's NEEDS-INPUT.md).",
+  answerChoice:
+    "The decision, which must be one of the blocker's listed choices.",
+  answerNote: "Optional reasoning or extra context to record with the answer.",
   resume:
     "Run id of a previous run to continue. Pass the same `script` and `args`: every agent call that already settled is answered from that run's ledger instead of being paid for again, and only unfinished or invalidated work runs. A script that does not match the recorded one is rejected rather than resumed.",
 };
@@ -27,6 +34,10 @@ export const WORKFLOW_TOOL_DESCRIPTION = [
   "• await agent(prompt, { label?, phase?, schema?, model?, provider?, effort? }) — run ONE subagent in an isolated context and wait for it. Always resolves to { ok, output, structured?, error? }. Check `ok` before using the result. When you pass a JSON `schema`, `structured` holds the validated object on success. `model`/`provider` override the session model; `effort` sets the thinking level (off|minimal|low|medium|high|xhigh|max). Children receive normal built-ins and trust-appropriate extensions, settings, skills, and AGENTS.md context, but cannot recursively orchestrate or ask the user.",
   "• await parallel([() => agent(...), () => agent(...)], { concurrency? }) — run zero-argument agent thunks concurrently and return results in order. Concurrency is globally capped at 4 for the run.",
   "• args — the parsed value of the `args` tool parameter (or undefined).",
+  "• assume({ question, assumption, evidence?, reversible?, step? }) — record what you proceeded on instead of asking, and keep going. This is the normal move for an implementation judgement call: do not stop the run for it.",
+  "• flag({ note, evidence?, step? }) — record something the reader must see, without stopping. Review findings belong here.",
+  "• await block({ decision, evidence, recommendation, choices: [...], step? }) — stop and wait for a person. Only for a fact you cannot obtain, an action only a human can take, or a decision whose branches each lose something. The run suspends; when the person answers, a resumed run gets { choice, note } from this call and carries on. `recommendation` and `choices` are required: hand over a decision, not a question.",
+  "• replan({ reason, conflictingEvidence?, suggestedClarifications: [...] }) — end the run because the plan itself is wrong (the spec contradicts itself, the task was misunderstood). Use this instead of block() when no answer would fix it.",
   "Workflow JavaScript runs in a restricted, killable child with no imports, eval, timers, filesystem, network, or process APIs. A run may make at most 32 agent calls and has no overall deadline. Each agent must receive its first assistant response event within 45 seconds so silent provider requests fail clearly; after that, agent() has no wall-clock deadline. Each individual child tool call times out independently after 3 minutes, becomes an error tool result, and leaves the agent loop free to recover. Use map/filter/if/await/template strings to orchestrate, and `return` a JSON-serializable aggregate.",
   "Pass a `schema` to agent() whenever a later step branches on the result, so you get typed fields instead of prose. A failed or interrupted run can be continued with the `resume` parameter: settled agent calls are answered from the run's ledger, so only the unfinished work costs anything. Artifacts are saved under ~/.pi/agent/workflows/<runId>/ for inspection.",
   "Example:",
@@ -44,10 +55,17 @@ export const WORKFLOW_TOOL_DESCRIPTION = [
 export const WORKFLOW_PROMPT_SNIPPET =
   "Orchestrate isolated subagents from an inline JS script: phase()/agent()/parallel() with structured outputs and optional background execution";
 
+/** Model-facing description of the answer tool. */
+export const WORKFLOW_ANSWER_TOOL_DESCRIPTION = [
+  "Answer an Attention Request from a suspended workflow run, then resume that run to continue past it.",
+  "Use this when a workflow reports it is awaiting input. The choice must be one of the blocker's listed choices; the answer is recorded durably, so resuming replays the run and the blocking call returns your answer instead of stopping again.",
+].join("\n");
+
 /** Guides the model on appropriate workflow fan-out and mandatory agent result checks. */
 export const WORKFLOW_PROMPT_GUIDELINES = [
   "Use workflow when a task needs several subagents with phase dependencies or dynamic fan-out; keep single small delegations in the main session.",
   "In workflow scripts, agent() never throws — always check `.ok` on its result before using `.output`/`.structured`.",
+  "A workflow never asks the user mid-run: record an assumption with assume(), surface a finding with flag(), and reserve block() for a decision nobody in the run can make.",
 ];
 
 /** Marks and forwards a workflow script's agent() task as an isolated child-model prompt. */
@@ -82,6 +100,49 @@ export function buildWorkflowResultMessage(
     lines.push(
       `Attempt ${details.attempt} (resumed); ${details.budgetUsed ?? 0} agent call(s) charged in total.`,
     );
+  }
+  if (details.blocker) {
+    lines.push(
+      "",
+      describeBlocker(details.blocker, details.runId),
+      "",
+      `Resume with: workflow resume=${details.runId} (same script and args) once the blocker is answered.`,
+    );
+  }
+  if (details.replan) {
+    lines.push(
+      "",
+      `Replanning needed: ${details.replan.reason}`,
+      ...(details.replan.conflictingEvidence
+        ? [`Conflicting evidence: ${details.replan.conflictingEvidence}`]
+        : []),
+      ...(details.replan.suggestedClarifications.length > 0
+        ? [
+            "Suggested clarifications:",
+            ...details.replan.suggestedClarifications.map(
+              (item) => `  - ${item}`,
+            ),
+          ]
+        : []),
+    );
+  }
+  const assumptions = details.assumptions ?? [];
+  if (assumptions.length > 0) {
+    // Irreversible assumptions first: those are the ones that matter if wrong.
+    const ordered = [...assumptions].sort(
+      (a, b) => Number(a.reversible) - Number(b.reversible),
+    );
+    lines.push("", `Assumptions (${assumptions.length}):`);
+    for (const assumption of ordered) {
+      lines.push(
+        `- ${assumption.reversible ? "" : "[irreversible] "}${assumption.question} → ${assumption.assumption}`,
+      );
+    }
+  }
+  const flags = details.flags ?? [];
+  if (flags.length > 0) {
+    lines.push("", `Flags (${flags.length}):`);
+    for (const flag of flags) lines.push(`- ${flag.note}`);
   }
   if (details.replay && details.replay.invalidated > 0) {
     lines.push(

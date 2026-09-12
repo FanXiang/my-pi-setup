@@ -37,6 +37,7 @@ import {
   shortenHome,
   stateSquare,
   statusColor,
+  isLiveStatus,
   statusWord,
   SQUARE,
   type Theme,
@@ -166,6 +167,8 @@ function normalizeDetails(
   const status =
     record.status === "running" ||
     record.status === "throttled" ||
+    record.status === "awaiting-input" ||
+    record.status === "replan-required" ||
     record.status === "failed" ||
     record.status === "aborted"
       ? record.status
@@ -284,7 +287,7 @@ export function loadRunEntries(
             // Older or partially written artifacts simply lack transcripts.
           }
         }
-        if (details.status === "running" || details.status === "throttled") {
+        if (isLiveStatus(details.status)) {
           details.status = "aborted";
           details.finishedAt = details.finishedAt ?? Date.now();
           details.error =

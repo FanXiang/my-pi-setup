@@ -1,6 +1,6 @@
 # Workflow v2：指挥型工作流规格（待审）
 
-状态：**草案，待审**。本文件是后续实现的契约。**M1 已实现**（§13），其余部分仍是设计。
+状态：**草案，待审**。本文件是后续实现的契约。**M1、M2、M4 已实现，M3 核心已随 M2 落地**（见 §13），其余部分仍是设计。
 
 ## 0. 背景与本版定位
 
@@ -374,6 +374,8 @@ interface FailureInfo {
 
 ## 7. 升级策略（三级 + replan）
 
+> **M4 实现说明**：升级原语暴露给**编排脚本**（即指挥），不暴露给子 agent。子 agent 通过结构化产物汇报情况，由脚本决定升到哪一级——这与"等级是 plan 的字段、由指挥强制"一致，也避免 worker 自行决定停不停。子 agent 主动升级**刻意推迟**，并且倾向于长期保持推迟。
+
 执行期不存在"问用户"，只存在三级升级。每步声明它**最高允许到哪级**，超出即 `replan-required`。
 
 | 级别 | 行为 | 适用 |
@@ -517,7 +519,9 @@ interface ProcedureMeta {
 | `index.ts:294` `session_shutdown` 全量 abort | detached run 改为**落盘后脱离**而非 abort；会话结束不杀 detached run（本版最小实现：落盘 + 下次会话可恢复；常驻 supervisor 属 N1） |
 | `ledger.ts` / `worktree.ts` | ✅ 新增。注意 `safeStringify` 是缩进 2 的 pretty-print，**不能**用于 JSONL；台账自己用 `toSerializable` + 无缩进 `JSON.stringify`。`before`/`after` 会重建成全新普通对象——共享引用会被序列化器换成 `"[circular]"` 标记，而复用判定正依赖这两个字段 |
 | `artifacts.ts` | blockers / assumptions 的原子追加写待 M4 |
-| `prompt.ts` | 重写工具描述；移除 "ultracode" 口令闸门；新增 plan/report/answer 的模型面文档 |
+| `prompt.ts` | ✅ 已加四个原语与 `workflow_answer` 的模型面文档、挂起/replan/假设/标记的结果回报；仍待：移除 "ultracode" 口令闸门、plan/report 文档 |
+| `escalation.ts` / `notify.ts` | ✅ 新增。`model.ts` 的 `statusWord` 把 `awaiting-input` 渲染成 **needs you**——停在人身上的 run 绝不能读起来像还在干活；`shared/activity-status.ts` 新增 `waiting` 计数，与 `failed` 分开（两者要求的反应相反）|
+| `dashboard.ts` / `listRuns` | ✅ `awaiting-input` / `replan-required` **不**被当成陈旧 run 回收成 `aborted`——它们正停在该停的地方且可恢复；新增 `isLiveStatus()` 统一这个判断 |
 | `dashboard.ts` | ✅ `throttled` 纳入状态收窄与陈旧 run 回收——此前一个持久化为 `throttled` 的死 run 会被显示成 `completed` |
 
 ## 13. 里程碑与验收测试
@@ -529,7 +533,7 @@ interface ProcedureMeta {
 | **M1** ✅ | 错误分类 + 重试观测 + RateLimitGovernor | **已完成。** `failure.ts` 分类（10 个测试，含"配额 429 不得当节流"）、`governor.ts` 节流治理（10 个测试，含窗口只延不缩、AIMD 回升、`wait` 的中断语义）、`controller.ts` 的准入闸门（4 个测试：节流期间零启动、在途不受扰、成功后重开槽位）、`runner.ts` 的 `recordRetryObservation`（4 个测试）。步骤级再尝试与 ledger 记账随 M2 落地 |
 | **M2** ✅ | Ledger + 恢复 | **已完成。** `ledger.ts`（内容寻址键 + append-only JSONL + 重放判定，19 个测试）、`worktree.ts`（git 探针，9 个测试）、`workflow` 工具的 `resume` 参数、预算跨恢复累计。场景测试覆盖"杀在第 3 步 → 恢复只跑 3–5 → 前两步零调用 → 预算累计到 5"。**工具层集成本身无自动化测试**（需真实运行时），覆盖的是它依赖的台账契约 |
 | **M3** 🟡 | git SHA 钉住与传递作废 | **核心已随 M2 落地**（不这样做 M2 本身就不安全）：写过的调用钉住 `after` 状态，不匹配即作废，并沿 seq 顺序传递作废；可证明只读的调用（前后都干净且 HEAD 未动）豁免。**剩余**：精确传递作废需要 Plan IR 的 `blockedBy`——当前只能按"其后全部"这一保守近似 |
-| **M4** | L1/L2/L3 + 通知送达 + 回答消费 | AFK run 触发 L3：状态 `awaiting-input`，blocker 文件完整（含 recommendation 与 choices），通知送达被记录；`workflow_answer` 后恢复并越过该步 |
+| **M4** ✅ | L1/L2/L3 + 通知送达 + 回答消费 | **已完成。** 沙箱新增四个原语 `assume` / `flag` / `block` / `replan`（L3 复用 M2 的重放：未答则挂起，已答则直接返回）；`escalation.ts`（11 个测试，含"blocker 必须交出决定而非问题"的字段强制）、`notify.ts`（5 个测试，file + ui 双通道，逐通道记录送达）、沙箱 IPC 的 6 个子进程实测；`workflow_answer` 工具校验 choice 必须在 blocker 给出的选项内 |
 | **M5** | Plan IR + 校验器 | V1–V10 各有一个失败 fixture 被拒绝，并给出可读原因；合法计划通过 |
 | **M6** | matt-pocock provider 适配器（方案 A）+ 闸门 schema | **单张 AFK ticket 端到端**：澄清 → 一份 agent brief → implement → code-review → handoff，全程零 ask，闸门生效 |
 | **M7** | `inline` 步骤 + `workflow_report` | 含 `inline` 步骤的计划在主会话执行该步并保留原文；V7 拒绝其 detached 运行 |
@@ -561,5 +565,8 @@ interface ProcedureMeta {
 8. 全部 run 状态可由外部进程仅凭磁盘读取重建（为 N1 留门）。
 9. 引擎不改写用户的全局设置文件；不合意的设置只提示，不代劳。
 11. 台账命中不消耗预算、不占并发槽。
+13. 执行期不向用户提问：只有 L1/L2/L3 与 `replan`。
+14. 没有任何通道确认送达的 L3，必须在 run 自己的 error 字段里说出来。
+15. `workflow_answer` 只接受 blocker 列出的选项之一。
 12. 同一个 run 目录同时只能有一个活动 run 在写。
 10. 不在 SDK 已有重试之上叠加步骤内重试。

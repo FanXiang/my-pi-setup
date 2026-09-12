@@ -9,6 +9,8 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { formatContextUtilization } from "../shared/context-utilization.ts";
+import type { FailureInfo } from "./failure.ts";
+import type { GovernorSnapshot } from "./governor.ts";
 import { safeStringify } from "./serialization.ts";
 
 export type Theme = ExtensionContext["ui"]["theme"];
@@ -39,7 +41,13 @@ export function emptyUsage(): AgentUsage {
 }
 
 export type AgentState = "running" | "done" | "error";
-export type WorkflowStatus = "running" | "completed" | "failed" | "aborted";
+export type WorkflowStatus =
+  | "running"
+  /** Running, but holding new agents back until a provider throttle clears. */
+  | "throttled"
+  | "completed"
+  | "failed"
+  | "aborted";
 
 export type TranscriptRole =
   "user" | "assistant" | "thinking" | "tool" | "toolResult";
@@ -71,6 +79,10 @@ export interface AgentRecord {
   startedAt: number;
   finishedAt?: number;
   error?: string;
+  /** Classified cause, for failed agents. */
+  failure?: FailureInfo;
+  /** Session-level auto-retries this agent went through. */
+  retries?: number;
   preview: string;
   usage: AgentUsage;
   /** Normalized, serializable subagent conversation shown by /workflows. */
@@ -90,6 +102,8 @@ export interface WorkflowDetails {
   phases: { title: string; detail?: string }[];
   currentPhase?: string;
   agents: AgentRecord[];
+  /** Latest throttle state, when the run uses a governor. */
+  throttle?: GovernorSnapshot;
   result?: unknown;
   resultArtifact?: string;
   transcriptArtifact?: string;
@@ -107,7 +121,8 @@ export function stateSquare(state: AgentState, theme: Theme): string {
 
 export function statusSquare(status: WorkflowStatus, theme: Theme): string {
   if (status === "completed") return theme.fg("success", SQUARE);
-  if (status === "running") return theme.fg("warning", SQUARE);
+  if (status === "running" || status === "throttled")
+    return theme.fg("warning", SQUARE);
   return theme.fg("error", SQUARE);
 }
 
@@ -119,7 +134,7 @@ export function statusColor(
   status: WorkflowStatus,
 ): "success" | "warning" | "error" {
   if (status === "completed") return "success";
-  if (status === "running") return "warning";
+  if (status === "running" || status === "throttled") return "warning";
   return "error";
 }
 

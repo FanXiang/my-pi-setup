@@ -1,4 +1,7 @@
-const DEFAULT_CONCURRENCY = 4;
+import type { RateLimitGovernor } from "./governor.ts";
+
+/** Ceiling on simultaneous agents in one run; also the default. */
+export const MAX_CONCURRENCY = 4;
 export const MAX_AGENT_CALLS = 32;
 export const RUN_SHUTDOWN_TIMEOUT_MS = 8_000;
 
@@ -10,7 +13,7 @@ function abortError(signal: AbortSignal) {
 
 class Semaphore {
   private active = 0;
-  private readonly limit: number;
+  private limit: number;
   private queue: Array<{
     resolve: () => void;
     reject: (error: Error) => void;
@@ -20,6 +23,28 @@ class Semaphore {
 
   constructor(limit: number) {
     this.limit = limit;
+  }
+
+  /**
+   * Resize the window. Growing admits queued waiters immediately; shrinking
+   * only narrows future admissions, because cancelling in-flight agents to
+   * honor a smaller limit would throw away completed work.
+   */
+  setLimit(limit: number) {
+    const next = Math.max(1, Math.floor(limit));
+    if (next === this.limit) return;
+    const grew = next > this.limit;
+    this.limit = next;
+    if (!grew) return;
+    while (this.active < this.limit && this.queue.length > 0) {
+      const waiter = this.queue.shift()!;
+      if (waiter.signal.aborted) {
+        waiter.signal.removeEventListener("abort", waiter.onAbort);
+        waiter.reject(abortError(waiter.signal));
+        continue;
+      }
+      waiter.resolve();
+    }
   }
 
   acquire(signal: AbortSignal) {
@@ -83,11 +108,25 @@ export class RunController {
   private sealed = false;
   private parentAbort?: () => void;
   private parentSignal?: AbortSignal;
+  private unsubscribeGovernor?: () => void;
+  /** Run-wide throttle coordinator; absent for runs that do not use one. */
+  readonly governor: RateLimitGovernor | undefined;
 
-  constructor(parentSignal?: AbortSignal, concurrency = DEFAULT_CONCURRENCY) {
+  constructor(
+    parentSignal?: AbortSignal,
+    concurrency = MAX_CONCURRENCY,
+    governor?: RateLimitGovernor,
+  ) {
+    this.governor = governor;
     this.semaphore = new Semaphore(
-      Math.max(1, Math.min(DEFAULT_CONCURRENCY, Math.floor(concurrency))),
+      Math.max(1, Math.min(MAX_CONCURRENCY, Math.floor(concurrency))),
     );
+    if (governor) {
+      this.semaphore.setLimit(governor.concurrency);
+      this.unsubscribeGovernor = governor.subscribe((snapshot) =>
+        this.semaphore.setLimit(snapshot.concurrency),
+      );
+    }
     if (parentSignal) {
       this.parentSignal = parentSignal;
       this.parentAbort = () => this.abort("Parent operation was aborted");
@@ -135,6 +174,9 @@ export class RunController {
 
       let acquired = false;
       try {
+        // Hold new agents back while the run is throttled. In-flight work is
+        // untouched: the governor narrows admission, it never cancels.
+        if (this.governor) await this.governor.wait(taskAbort.signal);
         await this.semaphore.acquire(taskAbort.signal);
         acquired = true;
         if (taskAbort.signal.aborted) throw abortError(taskAbort.signal);
@@ -183,6 +225,8 @@ export class RunController {
   }
 
   private detachParent() {
+    this.unsubscribeGovernor?.();
+    this.unsubscribeGovernor = undefined;
     if (this.parentAbort) {
       this.parentSignal?.removeEventListener("abort", this.parentAbort);
     }

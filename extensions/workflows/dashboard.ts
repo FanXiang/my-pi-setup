@@ -165,6 +165,7 @@ function normalizeDetails(
 
   const status =
     record.status === "running" ||
+    record.status === "throttled" ||
     record.status === "failed" ||
     record.status === "aborted"
       ? record.status
@@ -283,7 +284,7 @@ export function loadRunEntries(
             // Older or partially written artifacts simply lack transcripts.
           }
         }
-        if (details.status === "running") {
+        if (details.status === "running" || details.status === "throttled") {
           details.status = "aborted";
           details.finishedAt = details.finishedAt ?? Date.now();
           details.error =

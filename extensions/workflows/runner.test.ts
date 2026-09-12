@@ -9,8 +9,10 @@ import { Type } from "typebox";
 import {
   createFirstResponseWatchdog,
   guardWorkflowChildTools,
+  recordRetryObservation,
   recordToolExecutionTiming,
   transcriptFromMessages,
+  type RetryObservation,
   type ToolExecutionTiming,
 } from "./runner.ts";
 
@@ -270,4 +272,104 @@ test("workflow children guard structured, normal, and dynamically registered too
   );
   assert.equal(dynamicSignal?.aborted, true);
   unsubscribe();
+});
+
+test("session auto-retries are recorded in order and reported as they schedule", () => {
+  const retries: RetryObservation[] = [];
+  const notified: RetryObservation[] = [];
+  const onRetry = (observation: RetryObservation) => {
+    notified.push(observation);
+  };
+
+  recordRetryObservation(
+    retries,
+    {
+      type: "auto_retry_start",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 2000,
+      errorMessage: "500 internal server error",
+    },
+    onRetry,
+  );
+  recordRetryObservation(
+    retries,
+    {
+      type: "auto_retry_start",
+      attempt: 2,
+      maxAttempts: 3,
+      delayMs: 4000,
+      errorMessage: "502 bad gateway",
+    },
+    onRetry,
+  );
+  recordRetryObservation(
+    retries,
+    { type: "auto_retry_end", success: true, attempt: 2 },
+    onRetry,
+  );
+
+  assert.deepEqual(
+    retries.map((r) => [r.attempt, r.delayMs, r.failure.class]),
+    [
+      [1, 2000, "provider_error"],
+      [2, 4000, "provider_error"],
+    ],
+  );
+  assert.equal(retries[1].succeeded, true);
+  assert.equal(retries[0].succeeded, undefined);
+  assert.equal(notified.length, 2, "only scheduled attempts notify the run");
+});
+
+test("a throttle is classified while the child is still retrying", () => {
+  const retries: RetryObservation[] = [];
+  let observed: RetryObservation | undefined;
+  recordRetryObservation(
+    retries,
+    {
+      type: "auto_retry_start",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 2000,
+      errorMessage:
+        "Server requested 90s retry delay (max: 60s). 429 rate_limit_error",
+    },
+    (observation) => {
+      observed = observation;
+    },
+  );
+
+  assert.equal(observed?.failure.class, "rate_limit");
+  assert.equal(observed?.failure.throttle, true);
+  assert.equal(observed?.failure.retryAfterMs, 90_000);
+});
+
+test("a retry end without a preceding start is ignored", () => {
+  const retries: RetryObservation[] = [];
+  recordRetryObservation(retries, {
+    type: "auto_retry_end",
+    success: false,
+    attempt: 0,
+    finalError: "gave up",
+  });
+  assert.deepEqual(retries, []);
+});
+
+test("an exhausted retry sequence is marked unsuccessful", () => {
+  const retries: RetryObservation[] = [];
+  recordRetryObservation(retries, {
+    type: "auto_retry_start",
+    attempt: 1,
+    maxAttempts: 1,
+    delayMs: 2000,
+    errorMessage: "429 rate limit",
+  });
+  recordRetryObservation(retries, {
+    type: "auto_retry_end",
+    success: false,
+    attempt: 1,
+    finalError: "429 rate limit",
+  });
+  assert.equal(retries[0].succeeded, false);
+  assert.equal(retries[0].failure.throttle, true);
 });

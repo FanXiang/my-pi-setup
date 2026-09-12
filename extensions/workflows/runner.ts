@@ -7,7 +7,14 @@
  * optional one-shot `structured_output` tool when a schema is supplied.
  *
  * `runAgent()` never throws: every failure mode (session creation, provider
- * errors, aborts, missing structured output) settles into an `AgentOutcome`.
+ * errors, aborts, missing structured output) settles into an `AgentOutcome`
+ * carrying a classified `failure`.
+ *
+ * The child session retries transient provider failures on its own (see
+ * `settings.retry`), so an outcome that reaches the caller has already spent
+ * that budget. Those attempts are reported as `retries`, and `onRetry` fires
+ * as each one is scheduled so a run can react to a throttle while the child
+ * is still working through it.
  */
 
 import {
@@ -23,6 +30,10 @@ import {
   type ExtensionContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import {
+  isContextOverflow,
+  isRetryableAssistantError,
+} from "@earendil-works/pi-ai";
 import { Type, type TSchema } from "typebox";
 import {
   bindChildSessionExtensions,
@@ -31,6 +42,12 @@ import {
   shutdownAndDisposeChildSession,
 } from "../shared/child-session.ts";
 import { createToolCallTimeoutGuard } from "../shared/tool-call-timeout.ts";
+import {
+  classifyFailure,
+  classifyRetryNotice,
+  engineFailure,
+  type FailureInfo,
+} from "./failure.ts";
 import { emptyUsage, type AgentUsage, type TranscriptEntry } from "./model.ts";
 import {
   buildWorkflowAgentPrompt,
@@ -52,11 +69,27 @@ type ToolTimingEvent = Extract<
   AgentSessionEvent,
   { type: "tool_execution_start" | "tool_execution_end" }
 >;
+type RetryEvent = Extract<
+  AgentSessionEvent,
+  { type: "auto_retry_start" | "auto_retry_end" }
+>;
 
 export interface ToolExecutionTiming {
   startedAt?: number;
   finishedAt?: number;
   durationMs?: number;
+}
+
+/** One session-level auto-retry attempt, as observed from the child's events. */
+export interface RetryObservation {
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  errorMessage: string;
+  /** Classification of the error that triggered this retry. */
+  failure: FailureInfo;
+  /** Set once the retry sequence ends. */
+  succeeded?: boolean;
 }
 
 export interface AgentOutcome {
@@ -66,6 +99,10 @@ export interface AgentOutcome {
   /** Captured structured_output payload when a schema was supplied. */
   structured?: unknown;
   error?: string;
+  /** Classified cause, present whenever `ok` is false. */
+  failure?: FailureInfo;
+  /** Session-level auto-retries the child went through, oldest first. */
+  retries: RetryObservation[];
   aborted: boolean;
   usage: AgentUsage;
   model?: string;
@@ -92,6 +129,8 @@ export interface RunAgentOptions {
   modelRegistry: ExtensionContext["modelRegistry"];
   signal?: AbortSignal;
   onProgress?: (progress: AgentProgress) => void;
+  /** Called as each session-level auto-retry is scheduled. */
+  onRetry?: (observation: RetryObservation) => void;
   /** Test-only override for the per-tool execution timeout. */
   toolCallTimeoutMs?: number;
   /** Test-only override for the first assistant response-event timeout. */
@@ -237,6 +276,33 @@ export function recordToolExecutionTiming(
     finishedAt: observedAt,
     ...(durationMs === undefined ? {} : { durationMs }),
   });
+}
+
+/**
+ * Fold the child's auto-retry events into an ordered observation list. The
+ * session emits `auto_retry_start` once per scheduled attempt and a single
+ * `auto_retry_end` when the sequence settles, so the classification of a
+ * throttle is available while the child is still retrying.
+ */
+export function recordRetryObservation(
+  retries: RetryObservation[],
+  event: RetryEvent,
+  onRetry?: (observation: RetryObservation) => void,
+) {
+  if (event.type === "auto_retry_start") {
+    const observation: RetryObservation = {
+      attempt: event.attempt,
+      maxAttempts: event.maxAttempts,
+      delayMs: event.delayMs,
+      errorMessage: event.errorMessage,
+      failure: classifyRetryNotice(event.errorMessage),
+    };
+    retries.push(observation);
+    onRetry?.(observation);
+    return;
+  }
+  const last = retries[retries.length - 1];
+  if (last) last.succeeded = event.success;
 }
 
 function toolMetadata(
@@ -462,10 +528,13 @@ export async function runAgent(
   } catch (error) {
     unsubscribeToolTimeout?.();
     if (session) await shutdownAndDisposeChildSession(session);
+    const message = `Failed to create agent session: ${errorText(error)}`;
     return {
       ok: false,
       output: "",
-      error: `Failed to create agent session: ${errorText(error)}`,
+      error: message,
+      failure: engineFailure("session_create_failed", message),
+      retries: [],
       aborted: false,
       usage: emptyUsage(),
       model: options.model?.id,
@@ -480,6 +549,8 @@ export async function runAgent(
   let contextWindow = childSession.model?.contextWindow;
   let stopReason: string | undefined;
   let errorMessage: string | undefined;
+  let lastAssistant: AgentMessage | undefined;
+  const retries: RetryObservation[] = [];
   const toolTimings = new Map<string, ToolExecutionTiming>();
 
   const sync = () => {
@@ -525,6 +596,7 @@ export async function runAgent(
       }
       if (msg.stopReason) stopReason = msg.stopReason;
       if (msg.errorMessage) errorMessage = msg.errorMessage;
+      lastAssistant = msg;
       break;
     }
   };
@@ -532,6 +604,10 @@ export async function runAgent(
   let markFirstResponse = () => {};
   const unsubscribe = childSession.subscribe((event) => {
     if (isAssistantResponseEvent(event)) markFirstResponse();
+    if (event.type === "auto_retry_start" || event.type === "auto_retry_end") {
+      recordRetryObservation(retries, event, options.onRetry);
+      return;
+    }
     if (
       event.type === "tool_execution_start" ||
       event.type === "tool_execution_end"
@@ -600,6 +676,8 @@ export async function runAgent(
       output,
       structured,
       error: "Agent was aborted",
+      failure: engineFailure("aborted", errorMessage ?? "Agent was aborted"),
+      retries,
       aborted: true,
       usage,
       model: modelId,
@@ -610,11 +688,27 @@ export async function runAgent(
 
   const failed = stopReason === "error" || errorMessage !== undefined;
   if (failed) {
+    // Defer to the SDK's own classifiers for transience and overflow: their
+    // pattern lists are the ones its retry loops already acted on.
+    const assistant =
+      lastAssistant?.role === "assistant" ? lastAssistant : undefined;
     return {
       ok: false,
       output,
       structured,
       error: errorMessage ?? "Agent failed",
+      failure: classifyFailure({
+        stopReason,
+        errorMessage,
+        contextOverflow: assistant
+          ? isContextOverflow(assistant, contextWindow ?? 0)
+          : false,
+        sdkRetryable: assistant
+          ? isRetryableAssistantError(assistant)
+          : undefined,
+        ...(modelId === undefined ? {} : { model: modelId }),
+      }),
+      retries,
       aborted: false,
       usage,
       model: modelId,
@@ -624,11 +718,14 @@ export async function runAgent(
   }
 
   if (options.schema !== undefined && structured === undefined) {
+    const message =
+      "Agent finished without calling structured_output; no structured result matching the schema was produced.";
     return {
       ok: false,
       output,
-      error:
-        "Agent finished without calling structured_output; no structured result matching the schema was produced.",
+      error: message,
+      failure: engineFailure("no_structured_output", message),
+      retries,
       aborted: false,
       usage,
       model: modelId,
@@ -641,6 +738,7 @@ export async function runAgent(
     ok: true,
     output,
     structured,
+    retries,
     aborted: false,
     usage,
     model: modelId,

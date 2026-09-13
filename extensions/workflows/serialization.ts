@@ -117,6 +117,77 @@ export function toSerializable(
   return visit(value, 0, "$root");
 }
 
+/**
+ * A plain JSON object of bounded size, depth and shape.
+ *
+ * Used wherever a schema arrives from outside the engine - a plan's gate, a
+ * script's structured-output request. The bounds are the point: an unbounded
+ * or self-referential "schema" reaches a serializer, a hash and a validator,
+ * and each of those is a place where a pathological value stops being data
+ * and starts being a denial of service. Prototype keys are refused for the
+ * same reason they are refused in predicate paths.
+ */
+export function isBoundedJsonObject(
+  value: unknown,
+): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const seen = new WeakSet<object>();
+  let nodes = 0;
+  const validate = (current: unknown, depth: number): boolean => {
+    if (++nodes > 10_000 || depth > 24) return false;
+    if (
+      current === null ||
+      typeof current === "string" ||
+      typeof current === "boolean"
+    ) {
+      return true;
+    }
+    if (typeof current === "number") return Number.isFinite(current);
+    if (Array.isArray(current)) {
+      return current.every((item) => validate(item, depth + 1));
+    }
+    if (typeof current !== "object") return false;
+    if (seen.has(current)) return false;
+    seen.add(current);
+    return Object.keys(current).every((key) => {
+      if (key === "__proto__" || key === "constructor" || key === "prototype") {
+        return false;
+      }
+      return validate((current as Record<string, unknown>)[key], depth + 1);
+    });
+  };
+  return validate(value, 0);
+}
+
+/**
+ * Stable JSON: object keys sorted, so two values that are equal always
+ * serialize alike and therefore hash alike.
+ *
+ * Shared by every content-addressed key in the conductor - ledger entries,
+ * blocker ids, the plan hash - because they have to agree. Two definitions of
+ * "canonical" that drift apart would make a hash mean different things in
+ * different files, and the failure would be silent: a cache that never hits,
+ * or an approval that never matches.
+ */
+export function canonicalJson(value: unknown, depth = 0): string {
+  if (depth > 24) return '"[depth]"';
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value) ?? "null";
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item, depth + 1)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  const pairs = Object.keys(record)
+    .sort()
+    .map(
+      (key) =>
+        `${JSON.stringify(key)}:${canonicalJson(record[key], depth + 1)}`,
+    );
+  return `{${pairs.join(",")}}`;
+}
+
 /** Serialize to valid JSON no larger than the requested cap. */
 export function safeStringify(
   value: unknown,

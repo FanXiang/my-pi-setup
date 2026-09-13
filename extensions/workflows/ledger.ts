@@ -27,7 +27,11 @@ import { appendFileSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import type { FailureInfo } from "./failure.ts";
 import type { AgentUsage } from "./model.ts";
-import { toSerializable, truncateUtf8 } from "./serialization.ts";
+import {
+  canonicalJson,
+  toSerializable,
+  truncateUtf8,
+} from "./serialization.ts";
 import {
   callHadEffects,
   worktreeMatches,
@@ -72,26 +76,6 @@ export interface LedgerEntry {
   usage: AgentUsage;
   model?: string;
   contextWindow?: number;
-}
-
-/** Stable JSON: object keys sorted, so an equal schema always hashes alike. */
-function canonicalJson(value: unknown, depth = 0): string {
-  if (depth > 24) return '"[depth]"';
-  if (value === undefined) return "null";
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value) ?? "null";
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => canonicalJson(item, depth + 1)).join(",")}]`;
-  }
-  const record = value as Record<string, unknown>;
-  const pairs = Object.keys(record)
-    .sort()
-    .map(
-      (key) =>
-        `${JSON.stringify(key)}:${canonicalJson(record[key], depth + 1)}`,
-    );
-  return `{${pairs.join(",")}}`;
 }
 
 /**

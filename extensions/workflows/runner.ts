@@ -54,7 +54,11 @@ import {
   STRUCTURED_OUTPUT_SYSTEM_INSTRUCTION,
   STRUCTURED_OUTPUT_TOOL_DESCRIPTION,
 } from "./prompt.ts";
-import { safeStringify, truncateUtf8 } from "./serialization.ts";
+import {
+  isBoundedJsonObject,
+  safeStringify,
+  truncateUtf8,
+} from "./serialization.ts";
 
 const AGENT_OUTPUT_MAX_BYTES = 64 * 1024;
 export const FIRST_RESPONSE_TIMEOUT_MS = 45_000;
@@ -170,42 +174,12 @@ export function guardWorkflowChildTools(
   });
 }
 
-function isJsonSchema(value: unknown): value is TSchema {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const seen = new WeakSet<object>();
-  let nodes = 0;
-  const validate = (current: unknown, depth: number): boolean => {
-    if (++nodes > 10_000 || depth > 24) return false;
-    if (
-      current === null ||
-      typeof current === "string" ||
-      typeof current === "boolean"
-    ) {
-      return true;
-    }
-    if (typeof current === "number") return Number.isFinite(current);
-    if (Array.isArray(current)) {
-      return current.every((item) => validate(item, depth + 1));
-    }
-    if (typeof current !== "object") return false;
-    if (seen.has(current)) return false;
-    seen.add(current);
-    return Object.keys(current).every((key) => {
-      if (key === "__proto__" || key === "constructor" || key === "prototype") {
-        return false;
-      }
-      return validate((current as Record<string, unknown>)[key], depth + 1);
-    });
-  };
-  return validate(value, 0);
-}
-
 /** Preserve the caller's full JSON Schema instead of lossy keyword conversion. */
 function jsonSchemaToTypebox(schema: unknown): TSchema {
-  if (!isJsonSchema(schema)) {
+  if (!isBoundedJsonObject(schema)) {
     throw new Error("structured output schema must be a bounded JSON object");
   }
-  return Type.Unsafe(schema);
+  return Type.Unsafe(schema as TSchema);
 }
 
 /**

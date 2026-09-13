@@ -100,6 +100,7 @@ import {
   buildWorkflowAgentPrompt,
   buildWorkflowResultMessage,
   WORKFLOW_PARAMETER_DESCRIPTIONS,
+  WORKFLOW_PLAN_TOOL_DESCRIPTION,
   WORKFLOW_PROMPT_GUIDELINES,
   WORKFLOW_PROMPT_SNIPPET,
   WORKFLOW_ANSWER_TOOL_DESCRIPTION,
@@ -111,8 +112,15 @@ import {
   type ThinkingLevel,
   type WorkflowModel,
 } from "./runner.ts";
+import { normalizePlanInput, planHash, type Plan } from "./plan.ts";
+import { writePlan } from "./plan-store.ts";
+import {
+  getMethodologyProvider,
+  listMethodologyProviders,
+} from "./provider.ts";
 import { runWorkflowSandbox } from "./sandbox.ts";
 import { safeStringify, writeFileAtomic } from "./serialization.ts";
+import { describeValidationReport, validatePlan } from "./validate.ts";
 import { readWorktreeState, type WorktreeState } from "./worktree.ts";
 
 const PREVIEW_LENGTH = 200;
@@ -469,6 +477,117 @@ export default function workflows(pi: ExtensionAPI) {
       if (!choice) return;
       const run = runs[labels.indexOf(choice)];
       if (run) ctx.ui.notify(runDetailText(run, activeDetails()), "info");
+    },
+  });
+
+  const PlanParams = Type.Object({
+    plan: Type.Unknown({
+      description: WORKFLOW_PARAMETER_DESCRIPTIONS.planPlan,
+    }),
+    mode: Type.Optional(
+      Type.String({
+        description: WORKFLOW_PARAMETER_DESCRIPTIONS.planMode,
+      }),
+    ),
+  });
+
+  pi.registerTool({
+    name: "workflow_plan",
+    label: "Plan Workflow",
+    description: WORKFLOW_PLAN_TOOL_DESCRIPTION,
+    parameters: PlanParams,
+
+    async execute(_toolCallId, params) {
+      const mode = params.mode === "detached" ? "detached" : "foreground";
+
+      // A rejected plan comes back as a normal result, not a thrown error.
+      // The model's reaction to a tool failure is to try again, and trying
+      // again with the same plan produces the same rejection; what it needs
+      // is to read the reasons and write a different plan.
+      const rejected = (
+        text: string,
+        details: Record<string, unknown> = {},
+      ) => ({
+        content: [{ type: "text" as const, text }],
+        details: { ok: false, mode, ...details },
+      });
+
+      let plan: Plan;
+      try {
+        const raw =
+          typeof params.plan === "string"
+            ? JSON.parse(params.plan)
+            : params.plan;
+        plan = normalizePlanInput(raw);
+      } catch (error) {
+        return rejected(
+          `That plan is not usable as written: ${errorText(error)}`,
+        );
+      }
+
+      const provider = getMethodologyProvider(plan.provider.id);
+      if (!provider) {
+        // Validating against no provider would make V1 and V2 pass by saying
+        // nothing, which is worse than refusing: the plan would look checked.
+        const installed = listMethodologyProviders();
+        return rejected(
+          [
+            `No methodology provider "${plan.provider.id}" is installed, so this plan's procedures and transitions cannot be checked.`,
+            installed.length > 0
+              ? `Installed: ${installed.map((entry) => `${entry.id}@${entry.version}`).join(", ")}.`
+              : "No providers are installed in this session.",
+          ].join(" "),
+          { planId: plan.planId, provider: plan.provider.id },
+        );
+      }
+
+      if (provider.catalogHash !== plan.provider.catalogHash) {
+        return rejected(
+          `Provider "${provider.id}" has changed since this plan was written (catalog ${plan.provider.catalogHash}, now ${provider.catalogHash}). Rebuild the plan from the current procedure list.`,
+          { planId: plan.planId },
+        );
+      }
+
+      const report = validatePlan(plan, { provider, mode });
+      if (!report.ok) {
+        return rejected(describeValidationReport(report), {
+          planId: plan.planId,
+          findings: report.findings,
+        });
+      }
+
+      const file = writePlan(path.join(getAgentDir(), "workflows"), plan);
+      const summary = plan.steps
+        .map(
+          (step) =>
+            `  ${step.id} (${step.kind}/${step.mode}, ${step.effects}) ${step.label}${
+              step.blockedBy.length > 0
+                ? ` <- ${step.blockedBy.join(", ")}`
+                : ""
+            }`,
+        )
+        .join("\n");
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              describeValidationReport(report),
+              `planId ${plan.planId}, ${plan.steps.length} step(s), budget ${plan.budget.agentCalls} agent call(s) at concurrency ${plan.budget.concurrency}.`,
+              summary,
+              `Saved to ${shortenHome(file)}.`,
+              "Nothing has run. Show this plan to the user; approval is theirs to give, and it freezes this exact planHash.",
+            ].join("\n"),
+          },
+        ],
+        details: {
+          ok: true,
+          mode,
+          planId: plan.planId,
+          planHash: report.planHash,
+          steps: plan.steps.length,
+        },
+      };
     },
   });
 

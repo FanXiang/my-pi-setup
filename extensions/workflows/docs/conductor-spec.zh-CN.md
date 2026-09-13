@@ -1,6 +1,6 @@
 # Workflow v2：指挥型工作流规格（待审）
 
-状态：**草案，待审**。本文件是后续实现的契约。**M1、M2、M4 已实现，M3 核心已随 M2 落地**（见 §13），其余部分仍是设计。
+状态：**草案，待审**。本文件是后续实现的契约。**M1、M2、M4、M5 已实现，M3 核心已随 M2 落地**（见 §13），其余部分仍是设计。
 
 ## 0. 背景与本版定位
 
@@ -139,7 +139,7 @@ interface FanoutItem { key: string; brief: string }
 interface Gate {
   schema: unknown;             // JSON Schema，作为 structured_output 的形状
   predicates: Predicate[];     // 对结构化产物的断言
-  verify?: { command: string; expectExit: number };  // 可选的仓内校验（测试/lint）
+  verify?: { script: string; expectExit?: number };  // 可选的仓内校验（测试/lint）
 }
 
 interface Predicate {
@@ -152,6 +152,10 @@ interface Predicate {
 ```
 
 谓词**刻意是声明式小语言，不是 JS**：它要在沙箱外求值、要能序列化进 ledger、要可审计，再开一个 eval 面不可接受。
+
+**`verify` 只能点名 `package.json` 里已声明的 script**（Q5 决定，M5 已实现）。计划是一个代码执行面，批计划的人等于批了闸门要跑的东西；点名 npm script 意味着他只需信任仓库自己的 `scripts`（读一次即可），而不必逐份计划审一行 shell。这个限制是**结构性**的——IR 里根本没有能装 shell 字符串的字段，`verify.command` 会被边界解析器显式拒绝并提示改用 `script`——所以写得再巧的计划也绕不过去。
+
+`schema` 一层**不由闸门求值器执行**：带闸门的步骤把这份 schema 作为子 agent 的 `structured_output` 形状下发，不合形状的产物压根不会成为结果（`runner.ts` 的 `jsonSchemaToTypebox`）。求值器负责的是 schema 表达不了的那半：不是"有没有 acceptance_criteria 这个字段"，而是"它里面到底有没有东西"。
 
 闸门判定顺序：`schema` 校验 → `predicates` 全过 → 可选 `verify` 命令退出码匹配。任一不过 → `gate-failed`（**不是** transient，见 §5）。
 
@@ -487,13 +491,15 @@ interface ProcedureMeta {
 | V1 | 每个 `step.procedure` 在 provider 中存在 |
 | V2 | 每条 `blockedBy` 边对应的 procedure 迁移经 `validateEdge` 合法 |
 | V3 | DAG 无环；无孤立步骤；存在至少一个无前驱的根 |
-| V4 | 每个 `mode: "AFK"` 步骤必须有 `gate` |
-| V5 | `step.escalation ≤ policy.maxEscalation`；`escalation === 3` 要求 `policy.blockable === true` |
-| V6 | `Σ step.budget.agentCalls ≤ plan.budget.agentCalls ≤ 引擎上限`；`plan.budget.concurrency ≤ 引擎上限` |
+| V4 | 每个 `mode: "AFK"` 步骤必须有 `gate`；且 `gate` 良构：`schema` 是有界 JSON 对象，`verify.script` 在 `task.cwd` 的 `package.json` 里确有声明 |
+| V5 | `step.escalation ≤ policy.maxEscalation`；`escalation === 3` 要求 `policy.blockable === true`；且 `≤ ProcedureMeta.maxEscalation`（provider 对该 procedure 设的上限，是硬上限不是建议） |
+| V6 | `Σ step.budget.agentCalls ≤ plan.budget.agentCalls ≤ 引擎上限`；`plan.budget.concurrency ≤ 引擎上限`；扇出步骤的 `budget.agentCalls` 不得少于 `fanout.items` 条数 |
 | V7 | `mode: "detached"` 的运行：计划不得含 `kind: "inline"` 步骤，不得含 `mode: "HITL"` 步骤 |
-| V8 | `effects: "repo"` 的步骤必须声明 `task.branch`；**任意时刻最多一个写仓步骤在途**；并发的写步骤必须各自 `effects: "worktree"` 并分配独立 worktree |
+| V8 | `effects: "repo"` 的步骤必须声明 `task.branch`；**任意时刻最多一个写仓步骤在途**——静态判定为：任意两个 `repo` 步骤必须被 DAG 全序（一个可达另一个），否则拒；`kind: "fanout"` + `effects: "repo"` 直接拒（N 个 agent 同时写一个 checkout，正是那个活 bug），写扇出必须走 `effects: "worktree"` |
 | V9 | detached 运行要求 `approval.planHash` 等于重算值 |
 | V10 | `policy.blockable === true` 的 detached 运行必须配置至少一个 `policy.notify` 渠道 |
+
+V3 的"无孤立步骤"判定：只在 `steps.length > 1` 时生效，指的是**既无前驱也无后继**的步骤——它要么该连边，要么该自成一份计划。
 
 **V8 同时暴露现有代码的一个活 bug**：`index.ts` 用 `createWorkflowResources(ctx.cwd, ...)` 给所有子 agent，即**全部子 agent 共享父进程 cwd**，而并发上限是 4。只读扇出没问题，**可写扇出会互相踩工作区**。v2 必须强制：并发的写步骤走独立 worktree。
 
@@ -519,6 +525,8 @@ interface ProcedureMeta {
 | `index.ts:294` `session_shutdown` 全量 abort | detached run 改为**落盘后脱离**而非 abort；会话结束不杀 detached run（本版最小实现：落盘 + 下次会话可恢复；常驻 supervisor 属 N1） |
 | `ledger.ts` / `worktree.ts` | ✅ 新增。注意 `safeStringify` 是缩进 2 的 pretty-print，**不能**用于 JSONL；台账自己用 `toSerializable` + 无缩进 `JSON.stringify`。`before`/`after` 会重建成全新普通对象——共享引用会被序列化器换成 `"[circular]"` 标记，而复用判定正依赖这两个字段 |
 | `artifacts.ts` | blockers / assumptions 的原子追加写待 M4 |
+| `plan.ts` / `gate.ts` / `validate.ts` / `plan-store.ts` / `provider.ts` | ✅ M5 新增。`canonicalJson` 从 `ledger.ts` 上提到 `serialization.ts` 共用——台账键、blocker id、`planHash` 必须对同一个"规范"达成一致，两份定义漂移会让哈希在不同文件里含义不同，且失败是静默的；`isJsonSchema` 同样上提为 `serialization.ts` 的 `isBoundedJsonObject`，供 V4 复用 |
+| `index.ts` | ✅ 注册 `workflow_plan`。校验失败**正常返回**而非 `throw`：模型对工具失败的自然反应是重试，而原样重试同一份计划只会得到同一条拒绝；它需要的是读理由、改计划 |
 | `prompt.ts` | ✅ 已加四个原语与 `workflow_answer` 的模型面文档、挂起/replan/假设/标记的结果回报；仍待：移除 "ultracode" 口令闸门、plan/report 文档 |
 | `escalation.ts` / `notify.ts` | ✅ 新增。`model.ts` 的 `statusWord` 把 `awaiting-input` 渲染成 **needs you**——停在人身上的 run 绝不能读起来像还在干活；`shared/activity-status.ts` 新增 `waiting` 计数，与 `failed` 分开（两者要求的反应相反）|
 | `dashboard.ts` / `listRuns` | ✅ `awaiting-input` / `replan-required` **不**被当成陈旧 run 回收成 `aborted`——它们正停在该停的地方且可恢复；新增 `isLiveStatus()` 统一这个判断 |
@@ -534,7 +542,7 @@ interface ProcedureMeta {
 | **M2** ✅ | Ledger + 恢复 | **已完成。** `ledger.ts`（内容寻址键 + append-only JSONL + 重放判定，19 个测试）、`worktree.ts`（git 探针，9 个测试）、`workflow` 工具的 `resume` 参数、预算跨恢复累计。场景测试覆盖"杀在第 3 步 → 恢复只跑 3–5 → 前两步零调用 → 预算累计到 5"。**工具层集成本身无自动化测试**（需真实运行时），覆盖的是它依赖的台账契约 |
 | **M3** 🟡 | git SHA 钉住与传递作废 | **核心已随 M2 落地**（不这样做 M2 本身就不安全）：写过的调用钉住 `after` 状态，不匹配即作废，并沿 seq 顺序传递作废；可证明只读的调用（前后都干净且 HEAD 未动）豁免。**剩余**：精确传递作废需要 Plan IR 的 `blockedBy`——当前只能按"其后全部"这一保守近似 |
 | **M4** ✅ | L1/L2/L3 + 通知送达 + 回答消费 | **已完成。** 沙箱新增四个原语 `assume` / `flag` / `block` / `replan`（L3 复用 M2 的重放：未答则挂起，已答则直接返回）；`escalation.ts`（11 个测试，含"blocker 必须交出决定而非问题"的字段强制）、`notify.ts`（5 个测试，file + ui 双通道，逐通道记录送达）、沙箱 IPC 的 6 个子进程实测；`workflow_answer` 工具校验 choice 必须在 blocker 给出的选项内 |
-| **M5** | Plan IR + 校验器 | V1–V10 各有一个失败 fixture 被拒绝，并给出可读原因；合法计划通过 |
+| **M5** ✅ | Plan IR + 校验器 | **已完成。** `plan.ts`（IR 类型 + `planHash` + 边界解析，23 个测试）、`gate.ts`（8 算子声明式求值器，17 个测试）、`validate.ts`（V1–V10，31 个测试，每条规则至少一个失败 fixture + 合法计划在前台/detached 两种模式下均通过）、`plan-store.ts`（落盘与回读，8 个测试）、`provider.ts`（provider 接口 + 注册表）、`workflow_plan` 工具。校验一次报出全部问题，不在第一条失败处停 |
 | **M6** | matt-pocock provider 适配器（方案 A）+ 闸门 schema | **单张 AFK ticket 端到端**：澄清 → 一份 agent brief → implement → code-review → handoff，全程零 ask，闸门生效 |
 | **M7** | `inline` 步骤 + `workflow_report` | 含 `inline` 步骤的计划在主会话执行该步并保留原文；V7 拒绝其 detached 运行 |
 | **M8** | 仪表盘：DAG / ledger / 等你 / 节流 / 恢复入口 | `suspended` 与 `awaiting-input` 文案与排序可区分；从仪表盘可直接恢复 |
@@ -546,12 +554,12 @@ interface ProcedureMeta {
 
 - ~~**Q1（阻塞 M1）**：SDK 是否暴露 provider HTTP 状态码与 `retry-after`？~~ **已确认，见 §5.0/§5.1。** 结论：不暴露——状态码与头只存在于 pi-ai 内部；扩展侧只有 `errorMessage` 字符串，所以 `rate_limit` 确实靠文本匹配识别，但**用的是 SDK 自己那份模式表**（`isRetryableAssistantError()` 公开导出），不是我们另写一套。真实 `retry-after` 只在超过 `maxRetryDelayMs` 时以 `Server requested Ns retry delay` 文本泄漏出来，已解析。另有两个意外收获：SDK 已有三层重试，引擎不该再加一层；`auto_retry_start` 事件让限流在子 agent 仍在退避时就可观测。
 - **Q1b（新，需决策）**：用户若在全局设置里关掉 `retry.enabled`，工作流子 agent 会继承关闭状态，长跑会变脆。是（a）检测到就提示、尊重用户设置，还是（b）给工作流子 agent 一个独立的重试配置键？倾向 (a)，因为 `setRetryEnabled()` 会改写用户全局设置文件，引擎无权这么做。
-- **Q2**：计划合成由谁做？（a）主会话模型按 provider 的 `listProcedures` 自己拼；（b）provider 的 `suggestPlan` 给草案、模型补 brief。倾向 (a) 起步，(b) 作为 matt-pocock 侧增强。
+- ~~**Q2（阻塞 M5）**：计划合成由谁做？~~ **已拍板：(a) 起步，并在 `MethodologyProvider` 里保留 `suggestPlan?()` 可选钩子。** 合成是主会话模型的活（读 `listProcedures()` 自己拼），让计划安全的是 V1–V10 而不是 provider。钩子现在只声明、不实现，M6 若证明 provider 拼骨架更稳，可直接填上而引擎不动——这正是"留钩子"而非"完全不留"的理由。
 - **Q3**：`workItemId` 与 matt-pocock 现有会话态（`src/workflow.ts` 的 `WORKFLOW_STATE_ENTRY`）如何对齐？是 v2 run 反向写回 matt-pocock 的状态记录，还是二者共用 `workItemId` 但各记各的？倾向后者（低耦合），但 `/matt-pocock` 菜单里需要能看到关联的 run。
 - **Q4**：detached run 在本版是否真的要脱离会话？最小可行是"会话结束前落盘，下次会话手动/自动恢复"，完整脱离需要常驻 supervisor（N1）。倾向最小可行。
-- **Q5**：`gate.verify` 允许执行仓内命令，这是计划里的一个代码执行面。是否限制为白名单（`package.json` scripts）而非任意 shell？倾向限制。
-- **Q6**：闸门谓词小语言的算子集是否够用？现在给了 8 个，宁可窄开始。
-- **Q7**：`script` 逃生口是否保留？保留则旧能力不丢，但模型可能绕过计划直接写 JS。倾向保留但仅限 `mode: "foreground"`。
+- ~~**Q5**：`gate.verify` 是否限制为白名单？~~ **已拍板：限制为 `package.json` scripts。** 见 §3.2：IR 里不存在能装 shell 字符串的字段，`verify.command` 被边界解析器显式拒绝。
+- **Q6**：闸门谓词小语言的算子集是否够用？现在给了 8 个，宁可窄开始。**M5 按 8 个实现**，语义见 `gate.ts`：`nonEmpty` 把纯空白视为空、把 `0`/`false` 视为有内容；`minLength`/`maxLength` 对字符串取 **trim 后**长度（否则用空格就能满足 minLength）；`eq`/`ne` 按规范化 JSON 比较，键序不算差异。M6 用真实闸门跑过再决定要不要加。
+- **Q7（仍未决，M5 未实现任何相关限制）**：`script` 逃生口是否保留？保留则旧能力不丢，但模型可能绕过计划直接写 JS。倾向保留但仅限 `mode: "foreground"`。
 
 ## 15. 设计不变量（实现时不得破坏）
 

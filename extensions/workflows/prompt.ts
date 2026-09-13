@@ -20,6 +20,10 @@ export const WORKFLOW_PARAMETER_DESCRIPTIONS = {
   answerChoice:
     "The decision, which must be one of the blocker's listed choices.",
   answerNote: "Optional reasoning or extra context to record with the answer.",
+  planPlan:
+    "The plan, as a JSON object (or a JSON string). Shape: { workItemId, task: { title, statement, cwd, branch? }, provider: { id, version, catalogHash }, budget: { agentCalls, concurrency }, policy: { blockable, maxEscalation, onGateFail, notify? }, steps: [...] }. Each step: { id, kind: inline|serial|fanout|script, mode: HITL|AFK, procedure, label, blockedBy: [stepId], brief, escalation: 1|2|3, effects: readonly|worktree|repo, gate?, budget?, fanout? }. An AFK step needs a gate: { schema, predicates: [{ path, op, value?, message? }], verify?: { script } } where op is one of exists, nonEmpty, minLength, maxLength, eq, ne, matches, everyNonEmpty, and `verify.script` names a script the repo\'s package.json already declares.",
+  planMode:
+    'Which kind of run to validate for: "foreground" (default) or "detached". Detached is stricter - it refuses inline and HITL steps, requires the plan to be approved, and requires a notify channel if the run may stop for a person.',
   resume:
     "Run id of a previous run to continue. Pass the same `script` and `args`: every agent call that already settled is answered from that run's ledger instead of being paid for again, and only unfinished or invalidated work runs. A script that does not match the recorded one is rejected rather than resumed.",
 };
@@ -59,6 +63,15 @@ export const WORKFLOW_PROMPT_SNIPPET =
 export const WORKFLOW_ANSWER_TOOL_DESCRIPTION = [
   "Answer an Attention Request from a suspended workflow run, then resume that run to continue past it.",
   "Use this when a workflow reports it is awaiting input. The choice must be one of the blocker's listed choices; the answer is recorded durably, so resuming replays the run and the blocking call returns your answer instead of stopping again.",
+].join("\n");
+
+/** Model-facing description of the planning tool. */
+export const WORKFLOW_PLAN_TOOL_DESCRIPTION = [
+  "Compose a workflow plan for the current task and check it against the admission rules. This never executes anything.",
+  "A plan is data, not code: a DAG of steps, each naming a procedure from an installed methodology provider, each with a brief that is the whole of what its agent will be told. Write it from the provider's procedure list; the rules below are what make it safe to run, not your confidence in it.",
+  "The plan is checked by V1-V10: the procedure exists (V1) and each edge is a legal transition (V2); the graph is a connected DAG (V3); every unattended step has a gate (V4); escalation fits the policy (V5); budgets add up (V6); a detached run has no step needing the session (V7); repo-writing steps cannot collide (V8); a detached run matches the plan that was approved (V9) and can reach a person if it may stop (V10).",
+  "Every problem is reported at once. Fix them and call again - calling again unchanged will fail again in the same way.",
+  "A plan that passes is stored and returned with its planId and planHash. It is not approved and not running: approval is the user's, and it freezes that exact hash.",
 ].join("\n");
 
 /** Guides the model on appropriate workflow fan-out and mandatory agent result checks. */

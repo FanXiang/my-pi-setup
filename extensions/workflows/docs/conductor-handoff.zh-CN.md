@@ -22,9 +22,11 @@
 
 ## 2. 当前状态
 
-**仓库**：`FanXiang/my-pi-setup`　**分支**：`claude/beautiful-shannon-wr1ndr`（已推送，工作区干净）
+**仓库**：`FanXiang/my-pi-setup`　**分支**：`claude/workflow-v2-conductor-m5-gwteyg`（已推送，工作区干净；它与 `claude/beautiful-shannon-wr1ndr` 同源，M5 之前两者内容完全一致）
 
 ```
+da50192 feat(workflows): admit a plan before it runs                                 ← M5
+604e654 docs(workflows): add an in-Pi verification playbook for M1-M4
 7739789 feat(workflows): escalate instead of asking, and suspend on a real blocker   ← M4
 a06f214 feat(workflows): resume a run from an append-only agent-call ledger          ← M2 + M3 核心
 0c93e6c feat(workflows): wire the throttle governor into workflow runs               ← M1 接线
@@ -33,7 +35,7 @@ c0f1e3d feat(workflows): classify agent failures and govern run-wide throttling 
 6df7969 docs(workflows): add conductor workflow v2 spec for review                   ← 规格
 ```
 
-25 个文件，+4559 / −89。
+M1–M4：25 个文件，+4559 / −89。M5 另加 5 个模块 + 4 个测试文件。
 
 | 里程碑 | 状态 |
 | --- | --- |
@@ -41,8 +43,8 @@ c0f1e3d feat(workflows): classify agent failures and govern run-wide throttling 
 | M2 台账 + 恢复 | ✅ |
 | M3 git SHA 钉住与传递作废 | 🟡 核心已随 M2 落地；**精确**传递作废等 Plan IR 的 `blockedBy`，现为"其后全部"的保守近似 |
 | M4 L1/L2/L3 + 通知送达 + 回答消费 | ✅ |
-| **M5 Plan IR + 校验器 V1–V10** | ⬜ **下一个任务** |
-| M6 matt-pocock provider 适配 + 闸门 schema | ⬜ |
+| M5 Plan IR + 校验器 V1–V10 | ✅ |
+| **M6 matt-pocock provider 适配 + 闸门 schema** | ⬜ **下一个任务** |
 | M7 inline 步骤 + `workflow_report` | ⬜ |
 | M8 仪表盘（DAG / ledger / 等你 / 节流 / 恢复入口） | ⬜ |
 | M9 frontier 走子（多步 DAG 并发调度） | ⬜ |
@@ -73,7 +75,15 @@ c0f1e3d feat(workflows): classify agent failures and govern run-wide throttling 
 - **并发子 agent 共享同一个 `ctx.cwd`**（`index.ts` 的 `createWorkflowResources(ctx.cwd, ...)`），并发上限 4。只读扇出没问题，**可写扇出会互相踩工作区**——这是规格校验 V8 要强制 worktree 隔离的原因，也是台账保守作废的诱因之一。
 - `sandbox.ts` 的 `MAX_AGENT_REQUESTS = 64` 是 **IPC 跑飞防护**（恢复时脚本会重放全部调用含命中的），真实花费由 `controller.ts` 的 `MAX_AGENT_CALLS = 32` 封顶并跨恢复累计。两者含义不同，不要合并。
 
-### 3.3 环境
+### 3.3 M5 新增的事实
+
+- **`canonicalJson` 已从 `ledger.ts` 上提到 `serialization.ts`**（函数体逐字未改，所以已有台账的哈希不变）。台账键、blocker id、`planHash` 必须对同一个"规范"达成一致；两份定义漂移会让同一个哈希在不同文件里含义不同，而且**失败是静默的**：一个永不命中的缓存，或一个永不匹配的批准。`runner.ts` 的 `isJsonSchema` 同样上提为 `isBoundedJsonObject`，供 V4 复用。
+- **`workflow_plan` 校验失败时正常返回，不 `throw`**。这正是 §7 里那条待决问题的处理方式：模型对工具失败的自然反应是重试，而原样重试同一份计划只会得到同一条拒绝。需要模型改东西的结果，不该长得像"再试一次"。
+- **没有 provider 时 `workflow_plan` 拒绝整份计划**，而不是跳过 V1/V2。对着空 provider 校验会让这两条"沉默地通过"，计划就会*看起来*被检查过——比直接拒绝糟得多。
+- **V8 的"任意时刻最多一个写仓步骤"是静态判定的**：任意两个 `repo` 步骤必须被 DAG 全序（一个可达另一个）。`kind: "fanout"` + `effects: "repo"` 直接拒——那正是 3.2 里那个活 bug 的形状。
+- **校验器一次报出全部问题**。一轮计划应该暴露所有毛病，而不是第一个毛病；否则修四次、每次才发现下一处，而它们从一开始就都在。
+
+### 3.4 环境
 
 - `node_modules` 未提交。新会话需先 `npm install`（约 12 秒，261 包）。
 - **本容器是 Node v22，仓库 `@types/node` 是 `^26`**。后果：`runner.test.ts` 里有 **3 个先前就存在的 watchdog 测试在 Node 22 下挂住**（`createFirstResponseWatchdog` 的 `timer.unref()` 让事件循环提前空闲），它们会**取消同文件后面的所有测试**。在 Node 22 下验证 `runner.test.ts` 的新测试必须用 `--test-name-pattern` 单独跑。**不要**基于 Node 22 的表现去"修"那 3 个测试。
@@ -90,44 +100,53 @@ c0f1e3d feat(workflows): classify agent failures and govern run-wide throttling 
 | `ledger.ts` | 内容寻址键（`inputHash#occurrence`）、append-only JSONL、`replayLedger` 复用判定。后来的失败覆盖先前同键的成功 |
 | `worktree.ts` | git 状态探针。`callHadEffects()`：只有"前后都干净且 HEAD 未动"才算无副作用，其余（含探测失败）一律钉住。判错只是多跑一次，反方向是产出错的东西 |
 | `escalation.ts` | L1/L2/L3 + replan 的类型、**输入校验**（脚本是模型写的，契约在边界强制）、内容寻址 blocker id、文件 IO。假设默认不可逆 |
+| `plan.ts` | Plan IR 类型 + `planHash`（规范化 JSON 去掉 `approval` 后 sha256）+ **边界解析** `normalizePlanInput`。计划是模型写的，所以契约在这里强制：拿到 `Plan` 值的模块都可以假定它结构良好，因为**没有别的地方能造出一个** |
+| `gate.ts` | 8 算子声明式求值器。求值器**一次报出全部失败**——一条条告诉子 agent 会把一次修复变成四次。`schema` 那一层不在这里跑（见规格 §3.2） |
+| `validate.ts` | V1–V10。**报告而不抛出**，且不在第一条失败处停 |
+| `plan-store.ts` | `~/.pi/agent/workflows/plans/<planId>.json`，缩进写（计划是给人读和 diff 的）。回读必过 `normalizePlanInput`：是我们自己写的文件，但文件是人能编辑的东西 |
+| `provider.ts` | `MethodologyProvider` 接口 + 注册表。引擎里**没有任何地方能点名一个 provider**，这是"引擎不懂方法论"从原则变成事实的地方 |
 | `notify.ts` | `NotifyChannel` 可插拔；file（总是可用，写 `NEEDS-INPUT.md`）+ ui。逐通道记录送达，一个都没成功时 run 在自己的 `error` 字段说出来 |
 
 **run 目录布局**（`~/.pi/agent/workflows/<runId>/`）：`script.js` `args.json` `workflow.json` `ledger.jsonl` `assumptions.jsonl` `flags.jsonl` `answers.jsonl` `blockers/<id>.json` `replan.json` `NEEDS-INPUT.md` `transcripts.json` `result.json`
 
 **沙箱原语**：`agent` `parallel` `phase` `args` `assume` `flag` `block` `replan`
 
-**工具**：`workflow`（新增 `resume` 参数）、`workflow_answer`（新增）
+**工具**：`workflow`（新增 `resume` 参数）、`workflow_answer`、`workflow_plan`（M5 新增：合成 + 校验，**不执行**）
+
+**计划目录**：`~/.pi/agent/workflows/plans/<planId>.json`
 
 ---
 
-## 5. 下一个任务：M5（Plan IR + 校验器）
+## 5. 下一个任务：M6（matt-pocock provider 适配器 + 闸门 schema）
 
-**为什么是它**：M3 的精确传递作废、M6 的 matt-pocock 适配、M7 的 inline 步骤、M9 的 frontier 调度**全都等它**。
+**为什么是它**：M5 把 `workflow_plan` 接上了，但**它现在会拒绝每一份计划**——没有任何 provider 注册，而对着"没有 provider"去跑 V1/V2 等于让它们默默通过，那比拒绝更糟（计划会*看起来*被检查过）。所以 M6 之前，计划这条路是通的但没有入口。这是 M5 诚实的边界，不是遗漏。
 
-**内容**（规格 §3 有完整类型定义）：
+**内容**（规格 §8，方案 A）：
 
-1. `plan.ts`：`Plan` / `Step` / `Gate` / `Predicate` 类型 + `planHash`（规范化 JSON 去掉 `approval` 后 sha256）
-2. 闸门谓词求值器：**声明式小语言，不是 JS**（要在沙箱外求值、可序列化、可审计，不能再开 eval 面）。算子集 8 个：`exists` `nonEmpty` `minLength` `maxLength` `eq` `ne` `matches` `everyNonEmpty`
-3. 准入校验 **V1–V10**（规格 §10），每条配一个失败 fixture
-4. `workflow_plan` 工具：合成 + 校验，**不执行**
+1. 适配器直接读已安装的 `pi-matt-pocock` 包目录，解析 `catalog.json` → `listProcedures()`
+2. `validateEdge` 接 `src/catalog.ts` 的 `allowedTransitions`（即 `src/workflow.ts:60` `transitionState` 今天在运行时做的检查，**前移到计划校验期**）
+3. `loadBrief` 复用 `src/resolver.ts` 的依赖闭包 + `<procedure-source>` 包装 + 64 KiB 上限
+4. `gateFor`：**新增** `packages/matt-pocock/schemas/*.json`，对应 `procedures/*-FORMAT.md`
+5. `catalogHash` 用于检测 provider 漂移——`workflow_plan` 已经在比对它了
+6. 在扩展加载时 `registerMethodologyProvider()`
 
-**V8 和 V7 是有牙齿的两条**：V8 要求 `effects: "repo"` 步骤声明分支、任意时刻最多一个写仓步骤在途、并发写步骤必须各自独立 worktree（修上面 3.2 那个活 bug）。V7 要求 detached 运行不得含 `inline` 或 `HITL` 步骤。
+**验收**：单张 AFK ticket 端到端——澄清 → 一份 agent brief → implement → code-review → handoff，全程零 ask，闸门生效。
 
-**开始 M5 前需要用户拍板 Q2**（见下）。
+**注意 `defaultStepKind` / `maxEscalation` 的分量不同**：前者是建议（计划可覆盖），后者是**硬上限**（V5 会拒超过它的计划）。provider 是唯一有资格说"这个 procedure 绝不该停下来等人"的一方。
 
----
+**M6 之前不要去走 DAG**（规格 §13 原话）。先用单张 ticket 把 ledger / 升级 / 恢复这条循环跑通，frontier 调度留给 M9。
 
 ## 6. 未决问题
 
 | # | 问题 | 我的倾向 |
 | --- | --- | --- |
 | **Q1b** | 用户全局关掉 `retry.enabled` 时，工作流子 agent 继承关闭、长跑变脆。(a) 检测到就提示、尊重用户设置；(b) 给工作流独立的重试配置键 | **(a)**。`setRetryEnabled()` 会改写用户全局设置文件，引擎无权这么做 |
-| **Q2** ⚠️ | **计划由谁合成**？(a) 主会话模型按 provider 的 `listProcedures` 自己拼；(b) provider 的 `suggestPlan` 给草案、模型补 brief。**阻塞 M5** | **(a)** 起步，(b) 作为 matt-pocock 侧增强 |
+| ~~Q2~~ | ~~计划由谁合成~~ | **已拍板 (a)**：模型按 `listProcedures()` 自己拼；`suggestPlan?()` 作为可选钩子保留在接口里、不实现，M6 可填。让计划安全的是 V1–V10，不是 provider |
 | **Q3** | `workItemId` 与 matt-pocock 现有会话态（`src/workflow.ts` 的 `WORKFLOW_STATE_ENTRY`）如何对齐 | 共用 `workItemId` 但各记各的（低耦合）；`/matt-pocock` 菜单里能看到关联 run |
 | **Q4** | detached run 本版是否真脱离会话 | 最小可行：会话结束前落盘，下次恢复。真脱离留给 N1 |
-| **Q5** | `gate.verify` 允许执行仓内命令，是计划里的一个代码执行面。是否限制为白名单（`package.json` scripts） | 限制 |
-| **Q6** | 闸门谓词算子集是否够用（现给 8 个） | 宁可窄开始 |
-| **Q7** | `script` 逃生口是否保留 | 保留，但仅限 `mode: "foreground"` |
+| ~~Q5~~ | ~~`gate.verify` 是否限制为白名单~~ | **已拍板：限制为 `package.json` scripts**，且是结构性限制——IR 里没有能装 shell 字符串的字段，`verify.command` 会被显式拒绝并提示改用 `script` |
+| **Q6** | 闸门谓词算子集是否够用（现给 8 个） | 宁可窄开始。M5 已按 8 个实现，**等 M6 用真实闸门跑过再决定要不要加** |
+| **Q7** ⚠️ | `script` 逃生口是否保留 | 保留，但仅限 `mode: "foreground"`。**M5 刻意没实现这条限制**——它还没被拍板，校验器不该执行未决的策略。要的话就是 V7 加一行 |
 
 ---
 
@@ -143,7 +162,7 @@ node --test --experimental-strip-types extensions/workflows/*.test.ts
 node --test --experimental-strip-types --test-name-pattern="retr|throttle" extensions/workflows/runner.test.ts
 ```
 
-**当前基线**：101 个测试 / 94 通过 / **0 失败** / 7 cancelled（= Node 22 下先前就挂住的 3 个 + 被连带取消的 4 个）。
+**当前基线**：180 个测试 / 173 通过 / **0 失败** / 7 cancelled（cancelled 全在 `runner.test.ts`，= Node 22 下先前就挂住的那几个 + 被连带取消的；M5 一个都没增减）。M5 新增 79 个测试：`plan` 23 / `gate` 17 / `validate` 31 / `plan-store` 8。
 
 **端到端未验证**：工具层集成（`resume`、`block` 挂起 → `workflow_answer` → 恢复）**没有自动化测试**，需要真实 Pi 运行时。被测的是它依赖的契约层。人工验证步骤见 [`conductor-verify.zh-CN.md`](conductor-verify.zh-CN.md)（7 个场景，含隔离 agent 目录的做法）。
 
@@ -171,7 +190,8 @@ node --test --experimental-strip-types --test-name-pattern="retr|throttle" exten
 
 ## 9. 新会话开场可直接粘贴
 
-> 继续 `my-pi-setup` 的 Workflow v2 指挥型工作流重构。分支 `claude/beautiful-shannon-wr1ndr`。
+> 继续 `my-pi-setup` 的 Workflow v2 指挥型工作流重构。分支 `claude/workflow-v2-conductor-m5-gwteyg`。
 > 先读 `extensions/workflows/docs/conductor-handoff.zh-CN.md`（交接文档）和 `conductor-spec.zh-CN.md`（设计契约）。
-> M1/M2/M4 已完成、M3 核心已落地。下一个任务是 M5（Plan IR + 校验器 V1–V10），开始前先让我拍板 Q2（计划由谁合成）。
-> 环境：先 `npm install`；本容器 Node 22 而仓库目标 Node 26，`runner.test.ts` 有 3 个先前就挂住的测试会连带取消同文件后续测试，用 `--test-name-pattern` 单独验证。
+> M1/M2/M4/M5 已完成、M3 核心已落地。下一个任务是 M6（matt-pocock provider 适配器，方案 A + 闸门 schema）。
+> 注意：`workflow_plan` 现在会拒绝每一份计划，因为还没有任何 provider 注册——这是 M5 诚实的边界，M6 正是补上它。
+> 环境：先 `npm install`；本容器 Node 22 而仓库目标 Node 26，`runner.test.ts` 有先前就挂住的测试会连带取消同文件后续测试，用 `--test-name-pattern` 单独验证。

@@ -25,7 +25,7 @@
 **仓库**：`FanXiang/my-pi-setup`　**分支**：`claude/workflow-v2-conductor-m5-gwteyg`（已推送，工作区干净；它与 `claude/beautiful-shannon-wr1ndr` 同源，M5 之前两者内容完全一致）
 
 ```
-da50192 feat(workflows): admit a plan before it runs                                 ← M5
+3915000 feat(workflows): admit a plan before it runs                                 ← M5
 604e654 docs(workflows): add an in-Pi verification playbook for M1-M4
 7739789 feat(workflows): escalate instead of asking, and suspend on a real blocker   ← M4
 a06f214 feat(workflows): resume a run from an append-only agent-call ledger          ← M2 + M3 核心
